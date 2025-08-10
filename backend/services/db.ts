@@ -1,15 +1,30 @@
-import { Pool, neonConfig } from '@neondatabase/serverless';
-import { drizzle } from 'drizzle-orm/neon-serverless';
-import ws from "ws";
-import * as schema from "@shared/schema";
+// backend/services/db.ts
+import path from "path";
+import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+import { Pool } from "pg";
 
-neonConfig.webSocketConstructor = ws;
+// Load backend/.env here so env exists at import-time
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
-if (!process.env.DATABASE_URL) {
-  throw new Error(
-    "DATABASE_URL must be set. Did you forget to provision a database?",
-  );
+const DATABASE_URL: string | undefined = process.env.DATABASE_URL || undefined;
+
+// Export a simple flag other modules can check
+export const hasDb = !!DATABASE_URL;
+
+// Export a nullable pool so imports don’t crash in no‑DB mode
+export let pool: Pool | null = null;
+
+if (hasDb) {
+  pool = new Pool({ connectionString: DATABASE_URL });
 }
 
-export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-export const db = drizzle({ client: pool, schema });
+// Helper for modules that require a DB (and should fail fast if missing)
+export function requireDb() {
+  if (!hasDb || !pool) {
+    throw new Error("Database is not configured (DATABASE_URL not set).");
+  }
+  return { pool };
+}

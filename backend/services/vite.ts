@@ -1,85 +1,81 @@
-import express, { type Express } from "express";
-import fs from "fs";
+// backend/services/vite.ts
+import type { Express } from "express";
 import path from "path";
-import { createServer as createViteServer, createLogger } from "vite";
-import { type Server } from "http";
-import viteConfig from "../vite.config";
-import { nanoid } from "nanoid";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import { createServer as createViteServer, type ViteDevServer } from "vite";
 
-const viteLogger = createLogger();
-
-export function log(message: string, source = "express") {
-  const formattedTime = new Date().toLocaleTimeString("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
-  });
-
-  console.log(`${formattedTime} [${source}] ${message}`);
+export function log(msg: string) {
+  console.log(`[services] ${msg}`);
 }
 
-export async function setupVite(app: Express, server: Server) {
-  const serverOptions = {
-    middlewareMode: true,
-    hmr: { server },
-    allowedHosts: true as const,
-  };
+function paths() {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  const root = path.resolve(__dirname, "../../");      // project root
+  const dist = path.resolve(root, "dist");
+  const indexHtml = path.resolve(dist, "index.html");
+  const viteConfigFile = path.resolve(root, "vite.config.ts");
+  return { root, dist, indexHtml, viteConfigFile };
+}
 
-  const vite = await createViteServer({
-    ...viteConfig,
-    configFile: false,
-    customLogger: {
-      ...viteLogger,
-      error: (msg, options) => {
-        viteLogger.error(msg, options);
-        process.exit(1);
-      },
+/**
+ * Attach Vite dev middleware in development (no-op in production).
+ * IMPORTANT: override/disable proxy here to avoid proxy loops,
+ * and don't apply Vite middleware to /api/* routes.
+ */
+export async function setupVite(app: Express, httpServer?: import("http").Server) {
+  if (process.env.NODE_ENV === "production") return;
+
+  const { root, viteConfigFile } = paths();
+
+  // Create a Vite dev server in middleware mode,
+  // but OVERRIDE the proxy so it does not re-proxy /api back to :5000.
+  const vite: ViteDevServer = await createViteServer({
+    root,
+    configFile: viteConfigFile,
+    server: {
+      middlewareMode: true,
+      hmr: httpServer ? { server: httpServer } : undefined,
+      // Disable proxy here to prevent loops
+      proxy: undefined as any
     },
-    server: serverOptions,
     appType: "custom",
   });
 
-  app.use(vite.middlewares);
-  app.use("*", async (req, res, next) => {
-    const url = req.originalUrl;
-
-    try {
-      const clientTemplate = path.resolve(
-        import.meta.dirname,
-        "..",
-        "client",
-        "index.html",
-      );
-
-      // always reload the index.html file from disk incase it changes
-      let template = await fs.promises.readFile(clientTemplate, "utf-8");
-      template = template.replace(
-        `src="/src/main.tsx"`,
-        `src="/src/main.tsx?v=${nanoid()}"`,
-      );
-      const page = await vite.transformIndexHtml(url, template);
-      res.status(200).set({ "Content-Type": "text/html" }).end(page);
-    } catch (e) {
-      vite.ssrFixStacktrace(e as Error);
-      next(e);
-    }
+  // Only apply Vite middlewares for non-API paths
+  app.use((req, res, next) => {
+    if (req.path.startsWith("/api/")) return next();
+    return vite.middlewares(req, res, next);
   });
+
+  log("Vite dev middleware attached");
 }
 
-export function serveStatic(app: Express) {
-  const distPath = path.resolve(import.meta.dirname, "public");
+/**
+ * Serve the built client in production.
+ */
+export async function serveStatic(app: Express) {
+  if (process.env.NODE_ENV !== "production") return;
 
-  if (!fs.existsSync(distPath)) {
-    throw new Error(
-      `Could not find the build directory: ${distPath}, make sure to build the client first`,
-    );
+  const { dist, indexHtml } = paths();
+  if (!fs.existsSync(dist)) {
+    log("No dist/ folder found; skipping static serving");
+    return;
   }
 
-  app.use(express.static(distPath));
+  const serveStatic = (await import("serve-static")).default;
+  app.use(serveStatic(dist));
 
-  // fall through to index.html if the file doesn't exist
-  app.use("*", (_req, res) => {
-    res.sendFile(path.resolve(distPath, "index.html"));
+  app.use("*", async (_req, res, next) => {
+    try {
+      const html = fs.readFileSync(indexHtml, "utf-8");
+      res.setHeader("Content-Type", "text/html");
+      res.status(200).end(html);
+    } catch (err) {
+      next(err);
+    }
   });
+
+  log("Static assets served from dist/");
 }

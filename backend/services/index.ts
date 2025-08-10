@@ -1,139 +1,71 @@
-import express, { type Request, Response, NextFunction } from "express";
-import { registerRoutes } from "./routes";
-import { setupVite, serveStatic, log } from "./vite";
-import https from "https";
+// backend/services/index.ts
+import express, { type Request, type Response, type NextFunction } from "express";
+import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+import { createServer } from "http";
 
-// ESM equivalent of __dirname
+import { registerRoutes } from "./routes";
+import { setupVite, serveStatic, log } from "./vite";
+
+// ----- Resolve __dirname / load .env -----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Load env from backend/.env (VERY IMPORTANT)
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
+
+// ----- Express app -----
 const app = express();
+app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
 
-// Serve test files
-app.use(express.static(path.join(__dirname, '..')));
+// Flag for “no DB” fallback used in routes.ts
+const HAS_DB = !!process.env.DATABASE_URL;
+app.set("hasDb", HAS_DB);
 
-// Serve uploaded PDF files with proper headers
-app.get('/uploads/:filename', (req, res) => {
-  const filename = req.params.filename;
-  const filePath = path.join(__dirname, '../uploads', filename);
-  
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ message: 'File not found' });
-  }
-  
-  // Set proper headers for PDF viewing
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', 'inline');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; frame-src 'self' data:;");
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  res.setHeader('Cache-Control', 'public, max-age=3600');
-  
-  // Send the file
-  res.sendFile(filePath);
-});
+// Ensure uploads dir exists (multer uses this path)
+const uploadDir = path.join(__dirname, "../uploads");
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+  log(`Created upload directory at ${uploadDir}`);
+}
 
-// Fallback static serving for non-PDF files
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
-
-// Log API requests
-app.use((req, res, next) => {
-  const start = Date.now();
-  const path = req.path;
-  let capturedJsonResponse: Record<string, any> | undefined = undefined;
-
-  const originalResJson = res.json;
-  res.json = function (bodyJson, ...args) {
-    capturedJsonResponse = bodyJson;
-    return originalResJson.apply(res, [bodyJson, ...args]);
-  };
-
-  res.on("finish", () => {
-    const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
-      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
-
-      if (logLine.length > 80) logLine = logLine.slice(0, 79) + "…";
-      log(logLine);
-    }
-  });
-
+// Basic headers for static/PDF safety
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  res.setHeader("Content-Security-Policy", "default-src 'self' data: blob:;");
+  res.setHeader("Cache-Control", "public, max-age=3600");
   next();
 });
 
+// Simple health check
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, db: HAS_DB });
+});
+
 (async () => {
-  const server = await registerRoutes(app);
+  // Create HTTP server FIRST so Vite HMR can attach
+  const server = createServer(app);
 
-  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
+  // Attach Vite dev middleware in development
+  await setupVite(app, server);
 
-    res.status(status).json({ message });
-    throw err;
-  });
+  // Serve built client in production
+  await serveStatic(app);
 
-  if (app.get("env") === "development") {
-    await setupVite(app, server);
-  } else {
-    serveStatic(app);
-  }
+  // Register API routes
+  await registerRoutes(app);
 
-  // Try to create HTTPS server with self-signed certificate for PDF viewing
-  try {
-    const certsDir = path.resolve(__dirname, "../certs");
-    const keyPath = path.join(certsDir, "dev.key");
-    const certPath = path.join(certsDir, "dev.crt");
-
-    // Generate self-signed cert if it doesn't exist
-    if (!fs.existsSync(keyPath) || !fs.existsSync(certPath)) {
-      log("Generating self-signed certificate for HTTPS...");
-      const { execSync } = await import("child_process");
-      fs.mkdirSync(certsDir, { recursive: true });
-      
-      try {
-        execSync(
-          `openssl req -x509 -newkey rsa:2048 -nodes -out "${certPath}" -keyout "${keyPath}" -days 365 -subj "/CN=localhost"`,
-          { stdio: 'pipe' }
-        );
-        log("Self-signed certificate generated successfully");
-      } catch (opensslError) {
-        log("OpenSSL not available, skipping HTTPS setup");
-        throw opensslError;
-      }
-    }
-
-    if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
-      const httpsOptions = {
-        key: fs.readFileSync(keyPath),
-        cert: fs.readFileSync(certPath),
-      };
-
-      const httpsServer = https.createServer(httpsOptions, app);
-      const httpsPort = 5001;
-      httpsServer.listen(httpsPort, "0.0.0.0", () => {
-        log(`HTTPS server running at https://localhost:${httpsPort}`);
-        log("Use HTTPS URL for viewing PDFs to avoid CORS issues");
-      });
-    }
-  } catch (httpsError: any) {
-    log("HTTPS setup failed, continuing with HTTP only");
-    console.error("HTTPS Error:", httpsError.message);
-  }
-
-  // Start HTTP server on port 5000
+  // Start HTTP (match your vite proxy target http://localhost:5000)
   const httpPort = 5000;
   server.listen(httpPort, "0.0.0.0", () => {
     log(`HTTP server running at http://localhost:${httpPort}`);
-    log("Upload directory: " + path.join(__dirname, '../uploads'));
+    log(`Upload directory: ${uploadDir}`);
+    log(`DB mode: ${HAS_DB ? "Connected (DATABASE_URL set)" : "NO DB (bypassing writes)"}`);
   });
 })();
