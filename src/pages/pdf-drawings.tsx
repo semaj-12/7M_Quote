@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import ParsePanel from "@/components/ParsePanel";
+import PreParseSidebar from "@/components/PreParseSidebar";
 
 type UploadResp = {
   ok: boolean;
@@ -19,13 +20,33 @@ const API = (() => {
   return "";
 })();
 
-
 export default function PdfDrawings() {
   const [s3Url, setS3Url] = useState<string | null>(null);
+  const [s3Key, setS3Key] = useState<string | null>(null);
+  const [localPath, setLocalPath] = useState<string | null>(null);
+
   const [jobId, setJobId] = useState<string | null>(null);
-  const [parseStatus, setParseStatus] = useState<string | null>(null);
+  const [parseStatus, setParseStatus] = useState<string | null>(null); // "AWAIT_HINTS" | "PARSING" | "DONE" | "FAILED" | null
   const [parseResult, setParseResult] = useState<any>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+
+  // ── Pretend org/company until you wire real values from auth/backend
+  const companyName = useMemo(
+    () => (parseResult && (parseResult.companyName || parseResult.orgName)) || "Your Company",
+    [parseResult]
+  );
+  const orgId = useMemo(
+    () => (parseResult && (parseResult.orgId || parseResult.organizationId)) || "<org-id>",
+    [parseResult]
+  );
+
+  // We want a docVerId BEFORE parsing so the sidebar can save hints against it.
+  const [docVerId, setDocVerId] = useState<string>(() =>
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `docver-${Date.now()}`
+  );
 
   const mustJson = async (res: Response, label: string) => {
     const ct = res.headers.get("content-type") || "";
@@ -36,6 +57,7 @@ export default function PdfDrawings() {
     return res.json();
   };
 
+  // 1) User picks file → upload only. Do NOT start parsing yet.
   const onFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -43,28 +65,23 @@ export default function PdfDrawings() {
     setIsUploading(true);
     setParseStatus(null);
     setParseResult(null);
+    setJobId(null);
+    // new doc version id for this upload session
+    setDocVerId(typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `docver-${Date.now()}`);
 
     try {
-      // 1) Upload
       const fd = new FormData();
       fd.append("file", file);
       const upRes = await fetch(`${API}/api/upload`, { method: "POST", body: fd, cache: "no-store" });
       const resp = (await mustJson(upRes, "Upload")) as UploadResp;
       if (!resp.ok) throw new Error(resp.error || "Upload failed");
+
       setS3Url(resp.viewUrl || resp.s3Url);
+      setS3Key(resp.s3Key);
+      setLocalPath(resp.localPath ?? null);
 
-      // 2) Kick off Textract
-      const startRes = await fetch(`${API}/api/parse/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ s3Key: resp.s3Key, localPath: resp.localPath ?? null, useAI: false }),
-        cache: "no-store",
-      });
-      const start = await mustJson(startRes, "Parse start");
-      if (!start.ok) throw new Error(start.error || "parse start failed");
-
-      setJobId(start.jobId as string);
-      setParseStatus("STARTED");
+      // 👉 We stop here and show the Pre-parse sidebar FIRST
+      setParseStatus("AWAIT_HINTS");
     } catch (err: any) {
       console.error(err);
       alert(err.message || "Upload error");
@@ -73,12 +90,43 @@ export default function PdfDrawings() {
     }
   }, []);
 
-  // 3) Poll parsing status
+  // 2) After user answers sidebar, they click "Start parsing" (we’ll render the button below)
+  const startParsing = useCallback(async () => {
+    if (!s3Key) return;
+    setIsStarting(true);
+    try {
+      const startRes = await fetch(`${API}/api/parse/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // include docVerId/orgId so backend can correlate hints saved earlier
+        body: JSON.stringify({
+          s3Key,
+          localPath: localPath ?? null,
+          useAI: false,
+          docVerId,
+          orgId
+        }),
+        cache: "no-store",
+      });
+      const start = await mustJson(startRes, "Parse start");
+      if (!start.ok) throw new Error(start.error || "parse start failed");
+
+      setJobId(start.jobId as string);
+      setParseStatus("PARSING");
+    } catch (err: any) {
+      console.error(err);
+      alert(err.message || "Could not start parsing");
+    } finally {
+      setIsStarting(false);
+    }
+  }, [s3Key, localPath, docVerId, orgId]);
+
+  // 3) Poll parsing status once we have a jobId
   useEffect(() => {
     if (!jobId) return;
     let cancelled = false;
     (async () => {
-      setParseStatus("PARSING");
+      // we already set PARSING in startParsing; keep polling until done.
       while (!cancelled) {
         await new Promise((r) => setTimeout(r, 2000));
         const qs = new URLSearchParams({
@@ -86,9 +134,9 @@ export default function PdfDrawings() {
           region: "Anaheim, CA",
           laborRate: "65",
           useAI: "0",
+          docVerId
         });
         try {
-          // cache-buster + no-store so we never get a cached status
           const statusRes = await fetch(`${API}/api/parse/status?${qs.toString()}&t=${Date.now()}`, {
             cache: "no-store",
           });
@@ -105,6 +153,7 @@ export default function PdfDrawings() {
           }
         } catch (e) {
           console.error(e);
+          setParseStatus("FAILED");
           break;
         }
       }
@@ -112,7 +161,7 @@ export default function PdfDrawings() {
     return () => {
       cancelled = true;
     };
-  }, [jobId]);
+  }, [jobId, docVerId]);
 
   return (
     <div className="p-4 space-y-4">
@@ -131,11 +180,54 @@ export default function PdfDrawings() {
 
       {s3Url && (
         <div className="grid grid-cols-12 gap-4">
+          {/* Left: PDF viewer */}
           <div className="col-span-7 bg-white border rounded-md">
             <iframe src={s3Url} style={{ width: "100%", height: "80vh", border: "none" }} title="PDF" />
           </div>
-          <div className="col-span-5 bg-white border rounded-md max-h-[80vh] overflow-y-auto">
-            <ParsePanel status={parseStatus} result={parseResult} />
+
+          {/* Right column */}
+          <div className="col-span-5 bg-white border rounded-md">
+            {/* BEFORE parsing: show Pre-parse sidebar only */}
+            {parseStatus === "AWAIT_HINTS" && (
+              <div className="flex h-[80vh]">
+                <PreParseSidebar
+                  companyName={companyName}
+                  orgId={orgId}
+                  docVerId={docVerId}
+                />
+                {/* Start button rail */}
+                <div className="w-36 border-l p-3 flex flex-col justify-end">
+                  <button
+                    className="px-3 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
+                    onClick={startParsing}
+                    disabled={isStarting}
+                    title="Begin parsing with these answers"
+                  >
+                    {isStarting ? "Starting…" : "Start parsing"}
+                  </button>
+                  <p className="text-[11px] text-gray-500 mt-2">
+                    We’ll use your answers to improve takeoff & pricing.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* DURING/AFTER parsing: show ParsePanel; (optional) keep sidebar hidden */}
+            {parseStatus !== "AWAIT_HINTS" && (
+              <div className="flex h-[80vh]">
+                <div className="flex-1 overflow-y-auto">
+                  <ParsePanel status={parseStatus} result={parseResult} />
+                </div>
+                {/* If you want the sidebar to remain visible while PARSING, uncomment below:
+                {parseStatus !== "DONE" && (
+                  <PreParseSidebar
+                    companyName={companyName}
+                    orgId={orgId}
+                    docVerId={docVerId}
+                  />
+                )} */}
+              </div>
+            )}
           </div>
         </div>
       )}

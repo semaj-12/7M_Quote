@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+# System libs that sometimes help PyMuPDF on slim images
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg62-turbo libpng16-16 libfreetype6 libopenjp2-7 tzdata ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Python deps
+RUN pip install --no-cache-dir \
+    fastapi==0.112.2 \
+    uvicorn[standard]==0.30.6 \
+    boto3==1.34.162 \
+    pymupdf==1.24.9
+
+WORKDIR /app
+COPY main.py /app/main.py
+
+EXPOSE 7000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7000"]
