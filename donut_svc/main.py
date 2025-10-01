@@ -1,363 +1,243 @@
-import re
-from typing import List, Dict, Any, Optional
 import os
+import io
+import re
+import json
+from typing import List, Dict, Any, Optional
+
 import boto3
 import fitz  # PyMuPDF
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Body, HTTPException
 
-app = FastAPI(title="Donut Parser (Textract + Heuristics)", version="1.1.0")
+app = FastAPI(title="donut/layoutlmv3 microservice (phase-1 rules)")
 
 REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-1"
+s3 = boto3.client("s3", region_name=REGION)
 
-s3  = boto3.client("s3",       region_name=REGION)
-tex = boto3.client("textract", region_name=REGION)
+# --- helpers -----------------------------------------------------------------
 
+FRACT = re.compile(r"(?P<n>\d+)\s*/\s*(?P<d>\d+)")
 
-# ----------------------------- Models -----------------------------
+def _to_float_fraction(s: str) -> float:
+    """
+    Convert tokens like '11 27/32', '27/32', '1-1/2', '1 1/2' to float inches.
+    """
+    s = s.strip().replace("–", "-").replace("—", "-")
+    s = s.replace("″", '"').replace("’", "'").replace("”", '"')
+    # 1-1/2 -> 1 1/2
+    s = s.replace("-", " ")
 
-class AnalyzeReq(BaseModel):
-    bucket: str
-    key: str
-    max_pages: Optional[int] = 3
-    dpi: Optional[int] = 220
-
-
-class AnalyzeResp(BaseModel):
-    kv: Dict[str, str]
-    items: List[Dict[str, Any]]
-    totals: Dict[str, Any]
-    parts: List[Dict[str, Any]]  # NEW: structured parts w/ features for labor
-
-
-# ----------------------------- Utils ------------------------------
-
-def render_pages(pdf_bytes: bytes, max_pages: int = 3, dpi: int = 220) -> List[bytes]:
-    """Render first N pages as PNG byte arrays."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    images: List[bytes] = []
-    zoom = (dpi or 220) / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    for i, page in enumerate(doc):
-        if i >= (max_pages or 3):
-            break
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        images.append(pix.tobytes("png"))
-    doc.close()
-    return images
-
-
-def build_block_map(blocks: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {b["Id"]: b for b in blocks if "Id" in b}
-
-
-def text_from_children(block_map: Dict[str, Dict[str, Any]], block: Dict[str, Any]) -> str:
-    out: List[str] = []
-    for rel in block.get("Relationships", []):
-        if rel.get("Type") == "CHILD":
-            for cid in rel.get("Ids", []):
-                c = block_map.get(cid)
-                if not c:
-                    continue
-                if c.get("BlockType") in ("WORD", "LINE"):
-                    t = c.get("Text")
-                    if t:
-                        out.append(t)
-    return " ".join(out).strip()
-
-
-def parse_forms_kv(blocks: List[Dict[str, Any]]) -> Dict[str, str]:
-    block_map = build_block_map(blocks)
-    keys = {}
-    vals = {}
-    for b in blocks:
-        if b.get("BlockType") == "KEY_VALUE_SET":
-            types = b.get("EntityTypes", [])
-            if "KEY" in types:
-                keys[b["Id"]] = b
-            elif "VALUE" in types:
-                vals[b["Id"]] = b
-    kv: Dict[str, str] = {}
-    for k_id, k in keys.items():
-        ktxt = text_from_children(block_map, k)
-        vtxt = ""
-        for rel in k.get("Relationships", []):
-            if rel.get("Type") == "VALUE":
-                for vid in rel.get("Ids", []):
-                    v = vals.get(vid)
-                    if v:
-                        vtxt = text_from_children(block_map, v)
-                        break
-        k_norm = re.sub(r"\s+", " ", ktxt).strip(" :")
-        if k_norm:
-            kv[k_norm] = vtxt.strip()
-    return kv
-
-
-def collect_lines(blocks: List[Dict[str, Any]]) -> List[str]:
-    return [
-        b.get("Text", "")
-        for b in blocks
-        if b.get("BlockType") == "LINE" and b.get("Text")
-    ]
-
-
-def parse_tables(blocks: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-    """Return list of tables; each table is list of row-cells dicts {row, col, text}."""
-    block_map = build_block_map(blocks)
-    tables = []
-    for b in blocks:
-        if b.get("BlockType") != "TABLE":
-            continue
-        cells = []
-        for rel in b.get("Relationships", []):
-            if rel.get("Type") == "CHILD":
-                for cid in rel.get("Ids", []):
-                    cb = block_map.get(cid)
-                    if cb and cb.get("BlockType") == "CELL":
-                        cells.append({
-                            "row": cb.get("RowIndex", 0),
-                            "col": cb.get("ColumnIndex", 0),
-                            "text": text_from_children(block_map, cb),
-                        })
-        if not cells:
-            continue
-        by_row: Dict[int, List[Dict[str, Any]]] = {}
-        for c in cells:
-            by_row.setdefault(c["row"], []).append(c)
-        rows = []
-        for r in sorted(by_row.keys()):
-            rows.append(sorted(by_row[r], key=lambda x: x["col"]))
-        tables.append(rows)
-    return tables
-
-
-def guess_bom_items(tables: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """Map common BOM headers into simple items."""
-    items: List[Dict[str, Any]] = []
-
-    def norm(s: str) -> str:
-        return re.sub(r"\s+", " ", s or "").strip().upper()
-
-    for tbl in tables:
-        if not tbl:
-            continue
-        header = [norm(c["text"]) for c in tbl[0]]
-        if not header:
-            continue
-        idx_item = next((i for i, h in enumerate(header) if re.search(r"\b(ITEM|NO\.?|PART)\b", h)), None)
-        idx_qty  = next((i for i, h in enumerate(header) if re.search(r"\bQTY\b", h)), None)
-        idx_desc = next((i for i, h in enumerate(header) if re.search(r"\b(DESC(RIPTION)?|PART\s*NO\.?|DESCRIPTION)\b", h)), None)
-        idx_mat  = next((i for i, h in enumerate(header) if re.search(r"\b(MAT(ERI(AL)?)?|MATL|MATERIAL)\b", h)), None)
-        idx_unit = next((i for i, h in enumerate(header) if re.search(r"\b(UNIT|UOM)\b", h)), None)
-
-        if idx_qty is None or (idx_item is None and idx_desc is None):
-            continue
-
-        for row in tbl[1:]:
-            cols = [c["text"].strip() for c in row]
-            def get(i): return cols[i] if (i is not None and i < len(cols)) else ""
-            qty_raw = get(idx_qty)
-            qty = None
-            m = re.search(r"[-+]?\d*\.?\d+", qty_raw or "")
+    total = 0.0
+    for tok in s.split():
+        if "/" in tok:
+            m = FRACT.fullmatch(tok)
             if m:
-                try:
-                    qty = int(float(m.group(0)))
-                except Exception:
-                    pass
-            item = {
-                "description": get(idx_desc) or get(idx_item) or "",
-                "qty": qty,
-                "unit": get(idx_unit) or None,
-                "material": get(idx_mat) or None,
-            }
-            if any(v for v in item.values() if v not in (None, "")):
-                items.append(item)
+                total += float(m.group("n")) / float(m.group("d"))
+        else:
+            try:
+                total += float(tok)
+            except:
+                pass
+    return total
 
-    return items
+def parse_inches(token: str) -> Optional[float]:
+    """
+    Parse '8\' 11 27/32"' or '8\'' or '11 27/32"' or '1/4"' into inches.
+    """
+    t = token.strip().replace("″", '"').replace("’", "'").replace("”", '"')
+    ft_in = re.findall(r"(\d+)\s*'\s*([\d\s/.-]+)?\"?", t)
+    if ft_in:
+        ft = float(ft_in[0][0])
+        rest = ft_in[0][1] or "0"
+        return ft * 12.0 + _to_float_fraction(rest)
 
+    # pure inches with optional fraction
+    inch = re.findall(r"([\d\s/.-]+)\s*\"", t)
+    if inch:
+        return _to_float_fraction(inch[0])
 
-def pick_title_block(all_kv: Dict[str, str]) -> Dict[str, str]:
-    """Normalize likely title block fields from KV."""
-    kv_norm = {re.sub(r"\s+", " ", k).strip(" :").upper(): v for k, v in all_kv.items()}
-    out: Dict[str, str] = {}
-    def get_any(*keys):
-        for k in keys:
-            v = kv_norm.get(k)
-            if v:
-                return v
-        return ""
-    out["Revision"] = get_any("REV", "REVISION", "REV LEVEL")
-    out["Scale"]    = get_any("SCALE")
-    out["Drawing"]  = get_any("DWG", "DWG NO", "DRAWING", "DRAWING NO", "PART NUMBER", "PART NO")
-    out["Sheet"]    = get_any("SHEET", "SHEET NO", "SHT", "SHT NO")
-    out["Date"]     = get_any("DATE", "ISSUE DATE")
-    return out
+    # lone fraction like 1/4 (assume inches)
+    if FRACT.search(t):
+        return _to_float_fraction(t)
 
-
-# --------------------- Labor Feature Extraction ---------------------
-
-_re_part_no  = re.compile(r"\bPART\s*NO:\s*([A-Z0-9.\-]+)\b", re.I)
-_re_qty      = re.compile(r"\bQTY:\s*([A-Z0-9\s/]+)", re.I)           # e.g., "2 PER UNIT" -> 2
-_re_finish   = re.compile(r"\bFINISH:\s*([^\n]+)", re.I)
-_re_gauge    = re.compile(r"\b(\d{1,2})\s*GAUGE\b", re.I)
-_re_material = re.compile(r"\b(A36\s*PLATE|A500\s*TUBE|STAINLESS\s*STEEL|STEEL|ALUMINUM)\b", re.I)
-
-_re_csk      = re.compile(r"\bCOUNTERSUNK\s+HOLES?\s*(?:FOR\s+([#\d\-/\"]+))?", re.I)
-_re_tap      = re.compile(r"\bTAPPED\s+HOLES?\b.*?([#\d\-/\"]+)?", re.I)
-_re_weld     = re.compile(r"\b(WELDED\s+JOINTS|SPOT\s+WELD)\b", re.I)
-_re_radius   = re.compile(r"\bFORMED\s+RADIUS\s+BENDS?\b", re.I)
-
-def parse_part_from_text(text: str) -> Dict[str, Any]:
-    part: Dict[str, Any] = {
-        "sheet": None,
-        "partNo": None,
-        "qty": None,
-        "material": None,
-        "gauge": None,
-        "finish": None,
-        "features": {
-            "bends": {"count": 0, "hasRadiusBends": False},
-            "holes": {"countersunk": [], "tapped": []},
-            "weld": {"types": [], "lengthHintIn": None},
-            "notes": []
-        }
-    }
-
-    # Part No
-    m = _re_part_no.search(text)
-    if m:
-        part["partNo"] = m.group(1).strip()
-
-    # Quantity (normalize "2 PER UNIT" -> 2)
-    m = _re_qty.search(text)
-    if m:
-        qraw = m.group(1)
-        mm = re.search(r"\d+", qraw)
-        if mm:
-            part["qty"] = int(mm.group(0))
-
-    # Finish, Gauge, Material
-    m = _re_finish.search(text)
-    if m:
-        part["finish"] = m.group(1).strip()
-    m = _re_gauge.search(text)
-    if m:
-        try:
-            part["gauge"] = int(m.group(1))
-        except Exception:
-            pass
-    m = _re_material.search(text)
-    if m:
-        part["material"] = m.group(1).strip().upper()
-
-    # Features
-    if _re_radius.search(text):
-        part["features"]["bends"]["hasRadiusBends"] = True
-        # crude count heuristic: count "R" patterns near quotes (R1/4", R.125")
-        rcount = len(re.findall(r"\bR\s*[\d/.]+\"?", text, flags=re.I))
-        part["features"]["bends"]["count"] = max(part["features"]["bends"]["count"], rcount if rcount else 1)
-
-    for m in _re_csk.finditer(text):
-        size = (m.group(1) or "").strip() or None
-        part["features"]["holes"]["countersunk"].append({"size": size})
-
-    for m in _re_tap.finditer(text):
-        size = (m.group(1) or "").strip() or None
-        part["features"]["holes"]["tapped"].append({"size": size})
-
-    for m in _re_weld.finditer(text):
-        part["features"]["weld"]["types"].append(m.group(1).upper())
-
-    return part
-
-
-def parts_from_lines(lines: List[str]) -> List[Dict[str, Any]]:
-    # For phase-1, treat each page as a single part block. Concatenate lines and parse.
-    text = "\n".join(lines)
-    p = parse_part_from_text(text)
-
-    # Try to lift a sheet ID as fallback partNo if missing:
-    if not p.get("partNo"):
-        # common sheet codes (MT-####… etc.)
-        m = re.search(r"\b([A-Z]{1,3}-\d{2,4}[A-Z0-9.\-]*)\b", text)
-        if m:
-            p["partNo"] = m.group(1)
-    # If still missing, skip creating a noisy part
-    if not (p.get("partNo") or p.get("qty") or p.get("material") or p.get("finish")):
-        return []
-    return [p]
-
-
-# ------------------------------ Routes ------------------------------
-
-@app.get("/ping")
-def ping():
-    return {"ok": True}
-
-
-@app.post("/analyze", response_model=AnalyzeResp)
-def analyze(req: AnalyzeReq):
-    # 1) Fetch PDF
+    # bare number (assume inches)
     try:
-        obj = s3.get_object(Bucket=req.bucket, Key=req.key)
-        pdf_bytes = obj["Body"].read()
+        return float(t)
+    except:
+        return None
+
+GAUGE_TO_IN = {
+    # common stainless sheet gauge (approx)
+    # 16ga ≈ 0.0598", 14ga ≈ 0.0747", 18ga ≈ 0.0478"
+    18: 0.0478,
+    16: 0.0598,
+    14: 0.0747,
+}
+
+DENSITY = {
+    "steel": 0.283,      # lb/in^3
+    "stainless": 0.289,  # lb/in^3
+    "aluminum": 0.098,   # lb/in^3
+}
+
+def mat_from_text(s: str) -> Optional[str]:
+    s = s.lower()
+    if "stainless" in s or "ss" in s:
+        return "stainless"
+    if "aluminum" in s or "aluminium" in s or "6061" in s or "5052" in s:
+        return "aluminum"
+    if "a36" in s or "steel" in s or "a500" in s:
+        return "steel"
+    return None
+
+TUBE_RECT_RE = re.compile(
+    r'(?P<w>[\d\s/.-]+)"\s*[x×]\s*(?P<h>[\d\s/.-]+)"\s*[x×]\s*(?P<t>[\d\s/.-]+)"\s*(?:thk|wall)?',
+    re.IGNORECASE,
+)
+
+PLATE_THK_RE = re.compile(r'(?P<t>[\d\s/.-]+)"\s*(?:thk|thick)', re.IGNORECASE)
+GAUGE_SS_RE  = re.compile(r'(?P<g>\d+)\s*ga(?:uge)?\s+stainless', re.IGNORECASE)
+
+def extract_parts_from_text(doc_text: str) -> List[Dict[str, Any]]:
+    """
+    Heuristic extraction:
+      - Rect tube like: 1" x 3" x 1/8" THK   (+ material A500)
+      - Plate like: 1/4" THK A36 PLATE
+      - Stainless gauge like: 16 GAUGE STAINLESS (#4 finish)
+      - Lengths: find near-by X' Y" tokens; fallback to unknown
+    """
+    parts: List[Dict[str, Any]] = []
+
+    # Normalize whitespace/newlines a bit
+    txt = re.sub(r"[ \t]+", " ", doc_text)
+    txt = txt.replace("\r", "\n")
+    lines = [l.strip() for l in txt.split("\n") if l.strip()]
+
+    # collect candidate material lines to propagate material type
+    mat_hint = None
+    for i, line in enumerate(lines):
+        low = line.lower()
+
+        # Update material hint
+        mhint = mat_from_text(low)
+        if "a500" in low:
+            mat_hint = "steel"
+            grade = "A500"
+        elif "a36 plate" in low:
+            mat_hint = "steel"
+            grade = "A36"
+        elif "stainless" in low or "ss" in low:
+            mat_hint = "stainless"
+            grade = None
+        elif mhint:
+            mat_hint = mhint
+            grade = None
+
+        # Rect tube
+        m = TUBE_RECT_RE.search(line)
+        if m:
+            w = parse_inches(m.group("w")) or 0
+            h = parse_inches(m.group("h")) or 0
+            t = parse_inches(m.group("t")) or 0
+            if w and h and t:
+                # try to find a length on same or next line
+                neigh = " ".join(lines[i:i+2])
+                lm = re.search(r"(\d+'\s*[\d\s/.-]*\"?)", neigh)
+                length_in = parse_inches(lm.group(1)) if lm else None
+
+                parts.append({
+                    "shape": "tube_rect",
+                    "material": mat_hint or "steel",
+                    "grade": "A500" if "a500" in low else None,
+                    "thicknessIn": round(t, 5),
+                    "widthIn": round(w, 5),
+                    "heightIn": round(h, 5),
+                    "lengthIn": round(length_in, 5) if length_in else None,
+                    "features": {},
+                })
+                continue
+
+        # Plate thickness + A36 plate
+        p = PLATE_THK_RE.search(line)
+        if p and "plate" in low:
+            thk = parse_inches(p.group("t")) or 0
+            # try to find a rectangular area on same/next line: WxL inches
+            neigh = " ".join(lines[i:i+2])
+            wh = re.findall(r'([\d\s/.-]+)"\s*[x×]\s*([\d\s/.-]+)"', neigh, re.IGNORECASE)
+            w = h = None
+            if wh:
+                w = parse_inches(wh[0][0])
+                h = parse_inches(wh[0][1])
+            parts.append({
+                "shape": "plate",
+                "material": "steel",
+                "grade": "A36",
+                "thicknessIn": round(thk,5),
+                "widthIn": round(w,5) if w else None,
+                "lengthIn": round(h,5) if h else None,
+                "features": {},
+            })
+            continue
+
+        # Stainless gauge
+        g = GAUGE_SS_RE.search(line)
+        if g:
+            gauge = int(g.group("g"))
+            thk = GAUGE_TO_IN.get(gauge, None)
+            parts.append({
+                "shape": "sheet",
+                "material": "stainless",
+                "grade": None,
+                "thicknessIn": thk,
+                "features": {"finish": "#4"},
+            })
+            continue
+
+    return parts
+
+# --- api ---------------------------------------------------------------------
+
+@app.post("/analyze")
+def analyze(payload: Dict[str, Any] = Body(...)):
+    """
+    Body: { bucket, key, max_pages?, dpi? }
+    Returns: { kv, items, parts, totals }
+    """
+    bucket = payload.get("bucket")
+    key    = payload.get("key")
+    if not bucket or not key:
+        raise HTTPException(status_code=400, detail="bucket and key required")
+
+    # fetch pdf
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        data: bytes = obj["Body"].read()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"S3 get_object failed: {e}")
 
-    # 2) Render N pages
-    try:
-        imgs = render_pages(pdf_bytes, max_pages=req.max_pages or 3, dpi=req.dpi or 220)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Render failed: {e}")
+    # extract raw text with PyMuPDF
+    doc = fitz.open(stream=data, filetype="pdf")
+    pages_text: List[str] = []
+    for i, page in enumerate(doc):
+        pages_text.append(page.get_text("text"))
 
-    merged_kv: Dict[str, str] = {}
-    items_all: List[Dict[str, Any]] = []
-    parts_all: List[Dict[str, Any]] = []
-    pages_seen = 0
+    full_text = "\n".join(pages_text)
 
-    for img in imgs:
-        try:
-            out = tex.analyze_document(
-                Document={"Bytes": img},
-                FeatureTypes=["TABLES", "FORMS"],
-            )
-        except Exception:
-            continue
+    # materials hits (for debugging / UI)
+    hits = []
+    for line in full_text.splitlines():
+        if any(k in line.upper() for k in ["A36", "A500", "STAINLESS", "SS", "GAUGE", "THK", "PLATE", "TUBE"]):
+            hits.append(line.strip())
 
-        blocks = out.get("Blocks", []) or []
-        pages_seen += 1
+    parts = extract_parts_from_text(full_text)
 
-        # Forms → KV merge
-        kv = parse_forms_kv(blocks)
-        for k, v in kv.items():
-            if k not in merged_kv or not merged_kv[k]:
-                merged_kv[k] = v
-
-        # Tables → items (generic)
-        tables = parse_tables(blocks)
-        items_all.extend(guess_bom_items(tables))
-
-        # Lines → parts with labor features
-        lines = collect_lines(blocks)
-        parts = parts_from_lines(lines)
-        parts_all.extend(parts)
-
-    # Title block normalization
-    tb = pick_title_block(merged_kv)
-
-    kv_out = {
-        "Revision": tb.get("Revision", ""),
-        "Scale": tb.get("Scale", ""),
-        "Drawing": tb.get("Drawing", ""),
-        "Sheet": tb.get("Sheet", ""),
-        "Date": tb.get("Date", ""),
-        "PagesSeen": str(pages_seen),
+    kv = {
+        "PagesSeen": str(len(pages_text)),
     }
 
-    return AnalyzeResp(
-        kv=kv_out,
-        items=items_all,
-        totals={},
-        parts=parts_all,
-    )
+    return {
+        "kv": kv,
+        "items": [],     # legacy list not used for costing anymore
+        "parts": parts,  # the good stuff
+        "totals": {},
+        "materialsTextHits": hits[:200],  # cap for sanity
+    }

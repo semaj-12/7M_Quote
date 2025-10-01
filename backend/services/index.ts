@@ -6,9 +6,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
-import { createServer } from "http";
+import { createServer, request } from "http";
 
-// Your existing routers/utilities
 import { parseRouter } from "./routes.parse";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
@@ -19,10 +18,7 @@ import hintsRouter from "../routes/hints";
 import { randomUUID } from "crypto";
 import multer from "multer";
 
-import {
-  S3Client,
-  PutObjectCommand,
-} from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   TextractClient,
   StartDocumentAnalysisCommand,
@@ -45,10 +41,10 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = parseInt(process.env.PORT || "5000", 10);
-const REGION = process.env.AWS_REGION || "us-west-1";
+const REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-west-1";
 const DEFAULT_BUCKET = process.env.S3_BUCKET || "";
 
-// AWS clients (region can also be picked up from env/instance metadata)
+// AWS clients
 const s3 = new S3Client({ region: REGION });
 const textract = new TextractClient({ region: REGION });
 
@@ -110,6 +106,8 @@ export type NormalizedDoc = {
   };
   keyValues: Record<string, string>;
   items: NormalizedLineItem[];
+  // NEW: carry through structured parts from donut_svc
+  parts?: any[];
   totals?: {
     subtotal?: number;
     tax?: number;
@@ -176,21 +174,15 @@ async function fetchAllPages(jobId: string) {
     );
     if (out.Blocks) pages.push({ blocks: out.Blocks });
     nextToken = out.NextToken;
-    // safety sleep (Textract paginates results)
     if (nextToken) await new Promise((r) => setTimeout(r, 150));
   } while (nextToken);
   return pages;
 }
 
-// Donut/LayoutLMv3 call (FastAPI microservice). Requires Node 18+ (global fetch).
+// Donut/LayoutLMv3 call (FastAPI microservice)
 async function runDonutLayoutLMv3(s3Key: string, bucket: string): Promise<any> {
   const svcUrl = process.env.DONUT_SVC_URL || "http://localhost:7000/analyze";
-  const body = {
-    bucket,
-    key: s3Key,
-    max_pages: 3,
-    dpi: 220,
-  };
+  const body = { bucket, key: s3Key, max_pages: 3, dpi: 220 };
   const resp = await fetch(svcUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -206,7 +198,6 @@ async function runDonutLayoutLMv3(s3Key: string, bucket: string): Promise<any> {
 function normalize(textractPages: any[], donut: any, s3Key: string, bucket: string): NormalizedDoc {
   const kv: Record<string, string> = { ...(donut?.kv || {}) };
 
-  // Fallback title heuristic from first page lines
   const firstPage = textractPages?.[0]?.blocks || [];
   const firstLines = firstPage.filter((b: any) => b.BlockType === "LINE");
   const maybeTitle = (firstLines?.[0]?.Text || kv.Title || "").toString();
@@ -236,6 +227,8 @@ function normalize(textractPages: any[], donut: any, s3Key: string, bucket: stri
     },
     keyValues: kv,
     items,
+    // CRITICAL: include structured parts from donut_svc
+    parts: Array.isArray(donut?.parts) ? donut.parts : [],
     totals: {
       subtotal: num(totals.subtotal),
       tax: num(totals.tax),
@@ -251,9 +244,7 @@ const num = (v: any) => (v === undefined || v === null || v === "" ? undefined :
 
 async function beginPolling(awsJobId: string, jobKey: string) {
   try {
-    // Poll Textract until SUCCEEDED / FAILED
     while (true) {
-      // GetDocumentAnalysis without NextToken just to check status
       const out = await textract.send(new GetDocumentAnalysisCommand({ JobId: awsJobId }));
       const job = jobs.get(jobKey);
       if (!job) return;
@@ -266,7 +257,6 @@ async function beginPolling(awsJobId: string, jobKey: string) {
         job.statusMsg = "Running Donut/LayoutLMv3";
         jobs.set(jobKey, job);
 
-        // Model call
         const donut = await runDonutLayoutLMv3(job.s3Key, job.bucket || DEFAULT_BUCKET || "");
         job.donut = donut;
         job.stage = "NORMALIZED";
@@ -279,22 +269,21 @@ async function beginPolling(awsJobId: string, jobKey: string) {
       }
 
       if (out.JobStatus === "FAILED") {
-        const job = jobs.get(jobKey);
-        if (job) {
-          job.stage = "ERROR";
-          job.error = "Textract FAILED";
-          job.statusMsg = "Textract FAILED";
-          jobs.set(jobKey, job);
+        const j = jobs.get(jobKey);
+        if (j) {
+          j.stage = "ERROR";
+          j.error = "Textract FAILED";
+          j.statusMsg = "Textract FAILED";
+          jobs.set(jobKey, j);
         }
         break;
       }
 
-      // Still running
-      const j = jobs.get(jobKey);
-      if (j) {
-        j.stage = "RUNNING";
-        j.statusMsg = `Textract status: ${out.JobStatus || "IN_PROGRESS"}`;
-        jobs.set(jobKey, j);
+      const j2 = jobs.get(jobKey);
+      if (j2) {
+        j2.stage = "RUNNING";
+        j2.statusMsg = `Textract status: ${out.JobStatus || "IN_PROGRESS"}`;
+        jobs.set(jobKey, j2);
       }
 
       await new Promise((r) => setTimeout(r, 1500));
@@ -315,7 +304,7 @@ async function beginPolling(awsJobId: string, jobKey: string) {
 
 /**
  * POST /api/phase1/parse/start
- * Accepts EITHER:
+ * EITHER:
  *  - multipart/form-data:  file=<pdf>, optional field "bucket"
  *  - application/json:     { s3Key: string, bucket?: string }
  */
@@ -324,7 +313,6 @@ app.post("/api/phase1/parse/start", upload.single("file"), async (req: Request, 
     let s3Key: string | undefined;
     let chosenBucket: string | undefined;
 
-    // 1) Multipart: upload to S3 (or use provided bucket override)
     if (req.file) {
       const bucketField = (req.body?.bucket as string | undefined)?.trim();
       chosenBucket = bucketField || DEFAULT_BUCKET;
@@ -341,9 +329,7 @@ app.post("/api/phase1/parse/start", upload.single("file"), async (req: Request, 
           ContentType: "application/pdf",
         })
       );
-    }
-    // 2) JSON: use provided s3Key (and optional bucket)
-    else if (req.is("application/json") && (req.body as any)?.s3Key) {
+    } else if (req.is("application/json") && (req.body as any)?.s3Key) {
       const schema = z.object({
         s3Key: z.string().min(1),
         bucket: z.string().min(1).optional(),
@@ -359,7 +345,7 @@ app.post("/api/phase1/parse/start", upload.single("file"), async (req: Request, 
     if (!chosenBucket) return res.status(400).json({ error: "Missing S3 bucket" });
 
     console.log("[phase1] starting textract", {
-      region: process.env.AWS_REGION,
+      region: REGION,
       bucket: chosenBucket,
       key: s3Key,
     });
@@ -378,8 +364,8 @@ app.post("/api/phase1/parse/start", upload.single("file"), async (req: Request, 
     };
     jobs.set(jobKey, state);
 
-    // Kick off poller (fire-and-forget)
-    beginPolling(awsJobId, jobKey);
+    // fire and forget
+    void beginPolling(awsJobId, jobKey);
 
     return res.json({ jobId: jobKey, stage: state.stage });
   } catch (err: any) {
@@ -388,7 +374,7 @@ app.post("/api/phase1/parse/start", upload.single("file"), async (req: Request, 
   }
 });
 
-/** GET /api/phase1/parse/status/:jobId */
+/** GET /api/phase1/parse/status/:jobId  (path-param style) */
 app.get("/api/phase1/parse/status/:jobId", (req: Request, res: Response) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "Job not found" });
@@ -401,131 +387,164 @@ app.get("/api/phase1/parse/status/:jobId", (req: Request, res: Response) => {
   });
 });
 
+/** GET /api/phase1/parse/status?jobId=...  (query-param style to match UI) */
+app.get("/api/phase1/parse/status", (req: Request, res: Response) => {
+  const jobId = (req.query.jobId as string | undefined)?.split("&")[0]; // tolerate extra params
+  if (!jobId) return res.status(400).json({ error: "Missing jobId" });
+  const job = jobs.get(jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json({
+    id: job.id,
+    stage: job.stage,
+    status: job.statusMsg,
+    error: job.error,
+    normalized: job.stage === "DONE" ? job.normalized : undefined,
+  });
+});
+
 /* ---------------------------- Baseline / Delta ----------------------------- */
 
-app.post("/api/estimate/baseline", (req: Request, res: Response) => {
-  // Accept normalized doc + optional overrides
+app.get("/api/material-costs", (_req, res) => {
+  res.json({
+    updatedAt: new Date().toISOString(),
+    steel: { default: 0.75, a36: 0.75, a500: 0.80 },
+    stainless: { default: 2.50, "304": 2.40, "316": 3.10 },
+    aluminum: { default: 2.00, "5052": 1.90, "6061": 2.10 },
+  });
+});
+
+app.post("/api/estimate/baseline", (req, res) => {
   const schema = z.object({
     normalized: z.any(),
     opts: z.object({
-      hourlyRate: z.number().optional(),   // $/hr for labor, default 65
-      overheadPct: z.number().optional(),  // default 0.05
-      materialsPctOfSum: z.number().optional(), // legacy fallback when no items/parts
-    }).optional()
+      hourlyRate: z.number().optional(),
+      cutMinutesPerInch: z.number().optional(),
+      weldMinutesPerInch: z.number().optional(),
+      holeMinutesEach: z.number().optional(),
+      finishMinutesPerFt2: z.number().optional(),
+      overridesPerLb: z.record(z.number()).optional(),
+    }).optional(),
   });
-
   const { normalized, opts } = schema.parse(req.body);
-  const hourlyRate = opts?.hourlyRate ?? Number(process.env.HOURLY_RATE ?? 65);
-  const overheadPct = opts?.overheadPct ?? 0.05;
-  const legacyMatPct = opts?.materialsPctOfSum ?? 0.75;
 
-  const doc = normalized as any;
-
-  // ------- 1) Legacy materials/labor from line items (if present) -------
-  const lines = Array.isArray(doc?.items) ? doc.items : [];
-  const sumFromItems = lines.reduce((acc: number, it: any) => {
-    const line = (it?.lineTotal ?? ((it?.qty && it?.unitPrice) ? (it.qty * it.unitPrice) : 0)) || 0;
-    return acc + line;
-  }, 0);
-
-  const legacyBaseline = {
-    materials: sumFromItems * legacyMatPct,
-    labor: sumFromItems * (1 - legacyMatPct - overheadPct),
-    overhead: sumFromItems * overheadPct,
+  const H = {
+    hourlyRate: opts?.hourlyRate ?? 70,
+    cutMinPerIn: opts?.cutMinutesPerInch ?? 0.12,
+    weldMinPerIn: opts?.weldMinutesPerInch ?? 0.9,
+    holeMinEach: opts?.holeMinutesEach ?? 0.6,
+    finishMinPerFt2: opts?.finishMinutesPerFt2 ?? 3.0,
   };
 
-  // ------- 2) Labor from parts.features (new, preferred when present) -------
-  type Hole = { size?: string | null };
-  type PartsFeatures = {
-    bends?: { count?: number; hasRadiusBends?: boolean };
-    holes?: { countersunk?: Hole[]; tapped?: Hole[] };
-    weld?: { types?: string[]; lengthHintIn?: number | null };
-    notes?: string[];
-  };
-  type Part = {
-    sheet?: string | null;
-    partNo?: string | null;
-    qty?: number | null;
-    material?: string | null;
-    gauge?: number | null;
-    finish?: string | null;
-    features?: PartsFeatures;
+  const DENSITY: Record<string, number> = { steel: 0.283, stainless: 0.289, aluminum: 0.098 };
+  const DEFAULT_RATE_PER_LB: Record<string, number> = {
+    steel: 0.75, stainless: 2.50, aluminum: 2.00, ...(opts?.overridesPerLb || {}),
   };
 
-  const parts: Part[] = Array.isArray(doc?.parts) ? doc.parts : [];
+  const parts = (normalized?.parts ?? []) as any[];
 
-  const estimateLaborMinutesFromParts = (ps: Part[]) => {
-    let minutes = 0;
+  // fallback legacy split if no parts
+  if (!Array.isArray(parts) || parts.length === 0) {
+    const legacyLines = Array.isArray(normalized?.items) ? normalized.items : [];
+    const sum = legacyLines.reduce((acc: number, it: any) => {
+      const v = (it?.lineTotal ?? ((it?.qty && it?.unitPrice) ? (it.qty * it.unitPrice) : 0)) || 0;
+      return acc + v;
+    }, 0);
+    const baseline = {
+      materials: sum * 0.75,
+      labor: sum * 0.20,
+      overhead: sum * 0.05,
+      method: "legacy-items",
+    };
+    const baselineCost = baseline.materials + baseline.labor + baseline.overhead;
+    return res.json({ baseline, baselineCost });
+  }
 
-    const add = (m: number, count = 1) => { minutes += (m * count); };
+  function rectTubeArea(w: number, h: number, t: number) {
+    const perim = 2 * (w + h);
+    return perim * t; // in^2
+  }
+  function plateVolume(w: number, l: number, t: number) {
+    return w * l * t; // in^3
+  }
 
-    for (const p of ps) {
-      const qty = Number(p?.qty ?? 1) || 1;
-      const f = p?.features || {};
-      const bendsCount = Math.max(0, Number(f?.bends?.count ?? 0));
-      const hasRadius = !!f?.bends?.hasRadiusBends;
+  let materialWeightLb = 0;
+  let materialCost = 0;
+  let laborMinutes = 0;
+  const lines: any[] = [];
 
-      const cskCount = (f?.holes?.countersunk || []).length;
-      const tapCount = (f?.holes?.tapped || []).length;
+  for (const p of parts) {
+    const mat = (p.material || "steel").toLowerCase();
+    const dens = DENSITY[mat] ?? DENSITY.steel;
+    const rateLb = DEFAULT_RATE_PER_LB[mat] ?? DEFAULT_RATE_PER_LB.steel;
 
-      const weldTypes = (f?.weld?.types || []).map((x) => (x || "").toUpperCase());
-      const hasSpot = weldTypes.some(t => t.includes("SPOT"));
-      const hasWeld = weldTypes.some(t => t.includes("WELD"));
+    let wLb = 0, cutIn = 0, weldIn = 0, holeMin = 0, finishMin = 0;
 
-      // --- Rules (tunable) ---
-      // bends
-      if (bendsCount > 0) add(1.2 * bendsCount, qty);          // 1.2 min per bend
-      if (hasRadius) add(0.8, qty);                            // +0.8 min if radius bends present
-
-      // holes
-      if (cskCount > 0) add(0.6 * cskCount, qty);              // 0.6 min per countersink
-      if (tapCount > 0)  add(0.9 * tapCount, qty);             // 0.9 min per tapped hole
-
-      // weld
-      if (hasSpot) add(6, qty);                                // 6 min per part if spot welds
-      if (hasWeld) add(10, qty);                               // 10 min per part if welded joints
-
-      // finish
-      const finish = (p?.finish || "").toUpperCase();
-      if (finish.includes("POWDER COAT")) add(4, qty);         // 4 min per part
-
-      // material / gauge bump
-      const material = (p?.material || "").toUpperCase();
-      const gauge = p?.gauge ?? null;
-      const needsBump =
-        material.includes("A36") ||
-        material.includes("A500") ||
-        (gauge !== null && gauge <= 14);
-
-      if (needsBump) minutes *= 1.10; // +10%
+    if (p.shape === "tube_rect" && p.widthIn && p.heightIn && p.thicknessIn) {
+      const L = Number(p.lengthIn ?? 96);
+      const A = rectTubeArea(Number(p.widthIn), Number(p.heightIn), Number(p.thicknessIn));
+      const vol = A * L;
+      wLb = vol * dens;
+      cutIn += 2 * Math.max(Number(p.heightIn), Number(p.widthIn)) * 0.6;
     }
 
-    return Math.round(minutes * 100) / 100;
+    if (p.shape === "plate" && p.widthIn && p.lengthIn && p.thicknessIn) {
+      const vol = plateVolume(Number(p.widthIn), Number(p.lengthIn), Number(p.thicknessIn));
+      wLb = vol * dens;
+      cutIn += 2 * (Number(p.widthIn) + Number(p.lengthIn));
+    }
+
+    if (p.shape === "sheet" && p.thicknessIn) {
+      if (p.features?.finish === "#4" && p.widthIn && p.lengthIn) {
+        const ft2 = (Number(p.widthIn) * Number(p.lengthIn)) / 144.0;
+        finishMin += ft2 * H.finishMinPerFt2;
+      }
+    }
+
+    if (p.features?.holes && Array.isArray(p.features.holes)) {
+      holeMin += p.features.holes.length * H.holeMinEach;
+    }
+    if (p.features?.weldIn) {
+      weldIn += Number(p.features.weldIn);
+    }
+
+    const thisMat = wLb * rateLb;
+    const thisLaborMin = (cutIn * H.cutMinPerIn) + (weldIn * H.weldMinPerIn) + holeMin + finishMin;
+
+    materialWeightLb += wLb;
+    materialCost += thisMat;
+    laborMinutes += thisLaborMin;
+
+    lines.push({
+      shape: p.shape,
+      material: mat,
+      dims: { t: p.thicknessIn, w: p.widthIn, h: p.heightIn, L: p.lengthIn },
+      weightLb: Number(wLb.toFixed(3)),
+      materialCost: Number(thisMat.toFixed(2)),
+      cutIn: Number(cutIn.toFixed(2)),
+      weldIn: Number(weldIn.toFixed(2)),
+      holeMin: Number(holeMin.toFixed(2)),
+      finishMin: Number(finishMin.toFixed(2)),
+      laborMin: Number(thisLaborMin.toFixed(2)),
+    });
+  }
+
+  const laborCost = (laborMinutes / 60.0) * H.hourlyRate;
+  const overhead = 0.05 * (materialCost + laborCost);
+  const baselineCost = materialCost + laborCost + overhead;
+
+  const baseline = {
+    method: "parts-features",
+    materialWeightLb: Number(materialWeightLb.toFixed(2)),
+    materialCost: Number(materialCost.toFixed(2)),
+    laborMinutes: Number(laborMinutes.toFixed(1)),
+    laborCost: Number(laborCost.toFixed(2)),
+    overhead: Number(overhead.toFixed(2)),
+    lines,
+    heuristics: H,
   };
 
-  const laborMinutesFromParts = parts.length ? estimateLaborMinutesFromParts(parts) : 0;
-  const laborCostFromParts = Math.round(((laborMinutesFromParts / 60) * hourlyRate) * 100) / 100;
-
-  // If we have parts, prefer that labor number; otherwise fallback to legacy split.
-  const baseline = parts.length
-    ? {
-        materials: 0, // phase-1: unknown until you add weight/price; keep 0 or compute from items if you wish
-        labor: laborCostFromParts,
-        overhead: laborCostFromParts * overheadPct,
-        laborFromPartsMinutes: laborMinutesFromParts,
-        hourlyRate,
-        method: "parts-features"
-      }
-    : {
-        ...legacyBaseline,
-        method: "legacy-items"
-      };
-
-  const baselineCost = baseline.materials + baseline.labor + baseline.overhead;
-
-  res.json({ baseline, baselineCost });
+  res.json({ baseline, baselineCost: Number(baselineCost.toFixed(2)) });
 });
-
 
 app.post("/api/estimate/delta", (req: Request, res: Response) => {
   const schema = z.object({ baselineCost: z.number(), features: z.any().optional() });
@@ -535,6 +554,75 @@ app.post("/api/estimate/delta", (req: Request, res: Response) => {
   res.json({ deltaPct, adjustedCost });
 });
 
+// --- DASHBOARD / COMPANY / QUOTES / DRAWINGS STUBS ---
+
+// Company profile
+app.get("/api/company/:companyId", (req, res) => {
+  const { companyId } = req.params;
+  res.json({
+    id: companyId,
+    name: "Demo Fabrication Co.",
+    location: "Anaheim, CA",
+    currency: "USD",
+    createdAt: "2024-01-01T00:00:00Z",
+  });
+});
+
+// Dashboard stats
+app.get("/api/dashboard/stats/:companyId", (req, res) => {
+  res.json({
+    openQuotes: 5,
+    wonQuotes: 3,
+    lostQuotes: 4,
+    totalRevenue: 123456,
+    lastUpdated: new Date().toISOString(),
+  });
+});
+
+// Recent quotes
+app.get("/api/quotes/recent/:companyId", (req, res) => {
+  res.json([
+    { id: "Q-001", title: "Ticketing Countertop", amount: 18500, status: "open", createdAt: "2025-08-20T12:10:00Z" },
+    { id: "Q-002", title: "Charging Tables", amount: 9200, status: "won", createdAt: "2025-08-18T15:40:00Z" },
+    { id: "Q-003", title: "Sulfur Barn Steel", amount: 43750, status: "open", createdAt: "2025-08-15T10:05:00Z" },
+  ]);
+});
+
+// Drawings list
+app.get("/api/drawings/:companyId", (req, res) => {
+  res.json([
+    { id: "D-1001", name: "CED6704-001-001_NC1.pdf", pages: 2, uploadedAt: "2025-08-19T09:00:00Z" },
+  ]);
+});
+
+// --- MATERIAL COSTS (ARRAY SHAPE to satisfy materials.map) ---
+
+// Array form (what your component expects)
+app.get("/api/material-costs", (_req, res) => {
+  res.json([
+    { material: "steel",     grade: "default", pricePerLb: 0.75 },
+    { material: "steel",     grade: "a36",     pricePerLb: 0.75 },
+    { material: "steel",     grade: "a500",    pricePerLb: 0.80 },
+    { material: "stainless", grade: "default", pricePerLb: 2.50 },
+    { material: "stainless", grade: "304",     pricePerLb: 2.40 },
+    { material: "stainless", grade: "316",     pricePerLb: 3.10 },
+    { material: "aluminum",  grade: "default", pricePerLb: 2.00 },
+    { material: "aluminum",  grade: "5052",    pricePerLb: 1.90 },
+    { material: "aluminum",  grade: "6061",    pricePerLb: 2.10 },
+  ]);
+});
+
+// (Optional) Keep the old object form around in case anything else uses it
+app.get("/api/material-costs/object", (_req, res) => {
+  res.json({
+    updatedAt: new Date().toISOString(),
+    steel: { default: 0.75, a36: 0.75, a500: 0.80 },
+    stainless: { default: 2.50, "304": 2.40, "316": 3.10 },
+    aluminum: { default: 2.00, "5052": 1.90, "6061": 2.10 },
+  });
+});
+
+
 /* --------------------------------- Health --------------------------------- */
 
 app.get("/api/health", (_req, res) => {
@@ -542,7 +630,6 @@ app.get("/api/health", (_req, res) => {
 });
 
 /* --------------------------- Mount legacy routers -------------------------- */
-/* IMPORTANT: Phase-1 routes are defined BEFORE these to avoid collisions.    */
 
 app.use("/api", parseRouter);
 if (db) app.use("/api/hints", hintsRouter(db));

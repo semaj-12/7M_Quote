@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+torch
+transformers
+datasets
+accelerate
+sentencepiece
+Pillow
+pdf2image
+pytesseract
+opencv-python
