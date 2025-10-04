@@ -1,3 +1,4 @@
+require("ts-node/register/transpile-only");
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -11,6 +12,12 @@ const port = 5000;
 
 app.use(cors());
 app.use(express.json());
+
+const procoreRouter = require("./routes/routes.procore").default;
+const teklaRouter = require("./routes/routes.tekla").default;
+
+app.use("/api", procoreRouter);
+app.use("/api", teklaRouter);
 
 let tokens = {
   quickbooks: null,

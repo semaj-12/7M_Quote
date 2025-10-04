@@ -8,7 +8,7 @@ import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import { createServer, request } from "http";
 
-import { parseRouter } from "./routes.parse";
+import parseRouter from "./routes.parse";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 
