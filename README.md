@@ -12,7 +12,7 @@ Currently, two official plugins are available:
 If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
 # 7M_Quote
 
-7M Quote is a SaaS platform that helps skilled trade subcontractors generate quotes from blueprints/drawings in minutes instead of days.  
+7M Quote is a platform that helps skilled trade subcontractors generate quotes from blueprints/drawings in minutes instead of days.  
 Users upload PDFs or CAD files → AI extracts dimensions, identifies materials, predicts labor costs, and applies real-time pricing.  
 
 ## Docs
