@@ -1,0 +1,93 @@
+{
+  "primary": "reducto",
+  "mode": "hotspot",
+  "router": {
+    "TABLE":    ["reducto","layoutlmv3","donut","textract"],
+    "DIMENSION":["reducto","donut","layoutlmv3","textract"],
+    "WELD":     ["layoutlmv3","reducto","donut","textract"],
+    "NOTE":     ["textract","reducto","donut","layoutlmv3"],
+    "SECTION":  ["reducto","layoutlmv3"]
+  },
+  "hotspot": {
+    "low_conf_threshold": 0.75,
+    "max_regions_per_page": 999,
+    "region_padding_px": 24,
+    "escalation_order": ["layoutlmv3","donut","textract"],
+    "table_checks": {
+      "enable_total_check": true,
+      "total_tolerance_pct": 0.8,
+      "require_header_mapping": true,
+      "min_columns": 3
+    },
+    "dimension_checks": {
+      "unit_consistency": true,
+      "epsilon_in": 0.03125,
+      "epsilon_mm": 1.0,
+      "max_reasonable_in": 999.0
+    },
+    "weld_checks": {
+      "validate_symbol_set": true,
+      "require_side_when_symbol": true
+    }
+  },
+  "fusion_rules": {
+    "provider_weights": {
+      "TABLE":    { "reducto": 0.60, "layoutlmv3": 0.25, "donut": 0.10, "textract": 0.05 },
+      "DIMENSION":{ "reducto": 0.55, "donut": 0.30, "layoutlmv3": 0.10, "textract": 0.05 },
+      "WELD":     { "layoutlmv3": 0.60, "reducto": 0.30, "donut": 0.07, "textract": 0.03 },
+      "NOTE":     { "textract": 0.45, "reducto": 0.30, "donut": 0.20, "layoutlmv3": 0.05 },
+      "SECTION":  { "reducto": 0.65, "layoutlmv3": 0.25, "donut": 0.07, "textract": 0.03 }
+    },
+    "agreement_boost": 0.12,
+    "prefer_grid_from": "reducto",
+    "prefer_handwriting_from": "textract"
+  },
+  "calibration": {
+    "enabled": true,
+    "tables": "hybrid/config/tables_calib.json",
+    "dimensions": "hybrid/config/dims_calib.json",
+    "default": "identity"
+  },
+    "adjudicator": {
+    "enabled": true,
+    "default_model": "gpt-4.1-mini",
+    "max_conflicts": 20,
+    "prompt": "You are an adjudicator. Given conflicting candidates and schema, choose the value that best matches the image region and preserves schema validity. Never invent values.",
+    "models": {
+      "TABLE": "o1-mini",
+      "DIMENSION": "gpt-4.1-mini",
+      "WELD": "gpt-4.1-mini",
+      "NOTE": "gpt-4.1-mini",
+      "SECTION": "gpt-4.1-mini"
+    }
+  },
+  "validator": {
+    "enabled": true,
+    "llm": "openai:gpt-4.1-mini",
+    "rules": [
+      "BOM totals should equal sum(row totals) within ±0.8%.",
+      "All dimensions must include raw text, normalized unit, and normalized_to_in.",
+      "Welds must use valid AWS A2.4 combinations when present."
+    ]
+  },
+  "security": {
+    "log_redacted": true,
+    "redact_patterns": ["(?i)(ssn|account|routing|email)"]
+  },
+  "telemetry": {
+    "enabled": true,
+    "log_path": "logs/parsing",
+    "log_format": "ndjson",
+    "sample_rate": 1.0
+  },
+  "versions": {
+    "prompt_reducto": "hybrid/config/prompts/reducto/system_v1.md",
+    "schema_reducto": "hybrid/schemas/blueprint_v1.json",
+    "adapter_versions": {
+      "reducto": "1.0.0",
+      "textract": "1.0.0",
+      "donut": "ft-1.0.0",
+      "layoutlmv3": "ft-1.0.0"
+    }
+  }
+}

@@ -9,7 +9,7 @@ from transformers import LayoutLMv3ForTokenClassification, LayoutLMv3Processor
 # Env var so this is portable across machines
 DEFAULT_LLMV3_DIR = os.environ.get(
     "HYBRID_LLMV3_DIR",
-    "/home/sagemaker-user/7m/outputs/layoutlmv3/runs/Sep27_06-56-57_default"  # <-- fallback; okay on your box
+    "/home/sagemaker-user/7m/outputs/layoutlmv3"  # <-- fallback; okay on your box
 )
 
 # ---- Your 6-field schema (same as reconcile expects)

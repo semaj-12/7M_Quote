@@ -1,79 +1,58 @@
-# hybrid/textract_infer.py
-from __future__ import annotations
-import os
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
-
-try:
-    import boto3
-    _HAS_BOTO3 = True
-except Exception:
-    _HAS_BOTO3 = False
-
+# backend/hybrid/textract_infer.py
+import io, os, logging
+from typing import List, Dict
 from PIL import Image
+import boto3, botocore
 
-@dataclass
-class OCRToken:
-    text: str
-    bbox: Tuple[int, int, int, int]  # absolute pixel box (x0,y0,x1,y1)
+logger = logging.getLogger("hybrid.textract")
+logger.setLevel(logging.INFO)
 
-def _textract_client():
-    if not _HAS_BOTO3:
-        return None
+def _to_safe_jpeg_bytes(path: str, max_side: int = 3000, quality: int = 85) -> bytes:
+    im = Image.open(path).convert("RGB")
+    w, h = im.size
+    # shrink if huge (Textract + large PNGs can silently underperform)
+    scale = min(1.0, max_side / max(w, h))
+    if scale < 1.0:
+        im = im.resize((int(w*scale), int(h*scale)))
+        logger.info(f"[Textract] Downscaled {path} from {w}x{h} -> {im.size[0]}x{im.size[1]}")
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+def extract_words(image_path: str) -> List[Dict]:
+    """
+    Returns a list of {'text': str, 'bbox': (x0,y0,x1,y1)} using AWS Textract.
+    We resize + JPEG-reencode first to avoid PNG monster images that cause 0-word results.
+    """
+    # quick guard
+    if not os.path.exists(image_path):
+        logger.warning(f"[Textract] Missing path: {image_path}")
+        return []
+
+    payload = _to_safe_jpeg_bytes(image_path)
+
+    tex = boto3.client("textract")
     try:
-        return boto3.client("textract")
-    except Exception:
-        return None
-
-def _bbox_rel_to_abs(rel_bbox: Dict, page_w: int, page_h: int) -> Tuple[int,int,int,int]:
-    # Textract gives relative [0,1] bbox: Left, Top, Width, Height
-    x0 = int(rel_bbox.get("Left", 0.0)   * page_w)
-    y0 = int(rel_bbox.get("Top", 0.0)    * page_h)
-    x1 = x0 + int(rel_bbox.get("Width", 0.0)  * page_w)
-    y1 = y0 + int(rel_bbox.get("Height", 0.0) * page_h)
-    return (x0, y0, x1, y1)
-
-def textract_words_from_image(image_path: str) -> Tuple[List[OCRToken], Tuple[int,int]]:
-    """
-    Calls Textract DetectDocumentText on a local PNG/JPG.
-    Returns (tokens, (page_w, page_h)).
-    If Textract isn't available, returns ([], (w,h)) so the pipeline can still run.
-    """
-    # Determine pixel dimensions from the image itself (helpful to restore absolute coords)
-    with Image.open(image_path) as im:
-        im = im.convert("RGB")
-        page_w, page_h = im.size
-
-    client = _textract_client()
-    if client is None:
-        # Fallback: no OCR tokens (pipeline can still proceed using other branches)
-        return [], (page_w, page_h)
-
-    # Read bytes
-    with open(image_path, "rb") as f:
-        img_bytes = f.read()
-
-    try:
-        resp = client.detect_document_text(Document={"Bytes": img_bytes})
-    except Exception:
-        # Graceful fallback if AWS creds/permissions aren’t ready
-        return [], (page_w, page_h)
-
-    tokens: List[OCRToken] = []
-    for b in resp.get("Blocks", []):
-        if b.get("BlockType") == "WORD" and b.get("Text"):
-            bb_rel = b.get("Geometry", {}).get("BoundingBox", {})
-            bbox = _bbox_rel_to_abs(bb_rel, page_w, page_h)
-            tokens.append(OCRToken(text=b["Text"], bbox=bbox))
-
-    return tokens, (page_w, page_h)
-
-class TextractOCRProvider:
-    """
-    Thin helper usable by your pipeline.
-    """
-    def __init__(self):
-        pass
-
-    def from_image(self, image_path: str) -> Tuple[List[OCRToken], Tuple[int,int]]:
-        return textract_words_from_image(image_path)
+        resp = tex.detect_document_text(Document={"Bytes": payload})
+        blocks = resp.get("Blocks", [])
+        words = []
+        for b in blocks:
+            if b.get("BlockType") == "WORD" and "Text" in b:
+                bb = b.get("Geometry", {}).get("BoundingBox", {})
+                # normalized bbox (0..1). Keep it; adapters can map later.
+                words.append({
+                    "text": b["Text"],
+                    "bbox": (bb.get("Left",0.0), bb.get("Top",0.0),
+                             bb.get("Width",0.0), bb.get("Height",0.0))
+                })
+        logger.info(f"[Textract] {len(words)} words from {os.path.basename(image_path)} (blocks={len(blocks)})")
+        if not words:
+            logger.info(f"[Textract] No words found; try different max_side or check IAM/region.")
+        return words
+    except botocore.exceptions.ClientError as e:
+        err = e.response.get("Error", {})
+        logger.error(f"[Textract] ClientError: {err}")
+        return []
+    except Exception as e:
+        logger.exception(f"[Textract] Unexpected error: {e}")
+        return []

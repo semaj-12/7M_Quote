@@ -1,147 +1,167 @@
-# hybrid/openai_validator.py
-"""
-OpenAI Validator & JSON Normalizer for Tape Measure AI Hybrid Parsing Pipeline
--------------------------------------------------------------------------------
-Uses GPT-4.1 to:
- - Validate parsed output from Donut, LayoutLMv3, Textract
- - Repair malformed or partial JSON
- - Enforce consistent schema and numeric sanity
-"""
+# backend/hybrid/openai_validator.py
+from __future__ import annotations
 
 import os
 import json
 import logging
-from openai import OpenAI
 from typing import Dict, Any
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION
-# -----------------------------------------------------------------------------
-OPENAI_MODEL = "gpt-4.1"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+import httpx  # <-- we inject our own httpx client to avoid the 'proxies' kwarg issue
+from openai import OpenAI
 
-if not OPENAI_API_KEY:
-    raise EnvironmentError(
-        "Missing OPENAI_API_KEY environment variable. Run:\n"
-        '  export OPENAI_API_KEY="sk-..."'
-    )
+SCHEMA_KEYS = [
+    "weld_symbols_present",
+    "weld_symbols_count",
+    "dim_values_count",
+    "bom_tag_count",
+    "bom_material_count",
+    "bom_qty_count",
+]
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-logger = logging.getLogger("hybrid.openai_validator")
+# --- Logging ---
+logger = logging.getLogger("hybrid.openai_validator")  # just a label, not your API key
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(_h)
 
-# -----------------------------------------------------------------------------
-# SCHEMA DEFINITION
-# -----------------------------------------------------------------------------
-SCHEMA_TEMPLATE = {
-    "weld_symbols_present": False,
-    "weld_symbols_count": 0,
-    "dim_values_count": 0,
-    "bom_tag_count": 0,
-    "bom_material_count": 0,
-    "bom_qty_count": 0,
-}
+# --- Config ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY env var is not set")
 
-SCHEMA_DESC = """
-{
-  "weld_symbols_present": boolean,      // True if any weld symbols exist
-  "weld_symbols_count": integer,        // Count of weld symbols
-  "dim_values_count": integer,          // Count of dimension value annotations
-  "bom_tag_count": integer,             // Count of BOM header tags
-  "bom_material_count": integer,        // Count of BOM material rows
-  "bom_qty_count": integer              // Count of BOM quantity values
-}
+# Inject our own httpx.Client so the OpenAI SDK doesn't construct its wrapper (which passes 'proxies')
+_httpx = httpx.Client(timeout=60.0)  # no proxies kwarg here
+client = OpenAI(api_key=OPENAI_API_KEY, http_client=_httpx)
+
+SYSTEM_MSG = (
+    "You are a strict validator. You receive noisy model outputs and must return a **single JSON object** "
+    "with exactly these keys and types:\n"
+    "  - weld_symbols_present: boolean\n"
+    "  - weld_symbols_count: integer >= 0\n"
+    "  - dim_values_count: integer >= 0\n"
+    "  - bom_tag_count: integer >= 0\n"
+    "  - bom_material_count: integer >= 0\n"
+    "  - bom_qty_count: integer >= 0\n"
+    "If values are uncertain, make the best conservative estimate (0 if truly unknown). "
+    "Return only valid JSON with no extra keys, no comments, and no trailing commas."
+)
+
+USER_TEMPLATE = """Noisy inputs from earlier stages:
+
+DONUT_RAW:
+{donut_raw}
+
+LAYOUTLM_JSON:
+{layout_json}
+
+TEXTRACT_JSON:
+{textract_json}
+
+Return ONLY a JSON object with exactly these keys: {keys}.
 """
 
-# -----------------------------------------------------------------------------
-# HELPER: Local JSON sanity repair before calling GPT
-# -----------------------------------------------------------------------------
-def _local_repair(obj: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensures types and missing fields are fixed before sending to GPT."""
-    fixed = {}
-    for key, default in SCHEMA_TEMPLATE.items():
-        val = obj.get(key, default)
-        # Type coercion
-        if isinstance(default, bool):
-            val = bool(val)
-        else:
-            try:
-                val = int(val)
-            except Exception:
-                val = default
-        fixed[key] = val
-    return fixed
+def normalize_int(x: Any) -> int:
+    try:
+        v = int(x)
+        return max(0, v)
+    except Exception:
+        return 0
 
+def normalize_bool(x: Any) -> bool:
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    return s in {"true", "1", "yes", "y"}
 
-# -----------------------------------------------------------------------------
-# MAIN VALIDATION FUNCTION
-# -----------------------------------------------------------------------------
-def validate_counts_with_openai(raw_dict: Dict[str, Any]) -> Dict[str, Any]:
+def postprocess_schema(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure correct keys/types; fill missing with conservative defaults."""
+    out = {}
+    out["weld_symbols_present"] = normalize_bool(obj.get("weld_symbols_present", False))
+    out["weld_symbols_count"] = normalize_int(obj.get("weld_symbols_count", 0))
+    out["dim_values_count"] = normalize_int(obj.get("dim_values_count", 0))
+    out["bom_tag_count"] = normalize_int(obj.get("bom_tag_count", 0))
+    out["bom_material_count"] = normalize_int(obj.get("bom_material_count", 0))
+    out["bom_qty_count"] = normalize_int(obj.get("bom_qty_count", 0))
+    return out
+
+def validate_with_openai(
+    donut_raw: str,
+    layout_json: Dict[str, Any] | None,
+    textract_json: Dict[str, Any] | None,
+    model: str = "gpt-4.1",
+) -> Dict[str, Any]:
     """
-    Validates & repairs parsed data to conform to the 6-field schema.
-    Returns a clean dict that always passes JSON schema validation.
+    Calls OpenAI Responses API (via python SDK) to coerce/repair into our schema.
+    Returns a dict with exactly SCHEMA_KEYS.
     """
+    layout_str = json.dumps(layout_json or {}, ensure_ascii=False)
+    textract_str = json.dumps(textract_json or {}, ensure_ascii=False)
 
-    # Step 1: Basic local fix before GPT
-    base = _local_repair(raw_dict or {})
-
-    # Step 2: Construct system + user prompts
-    system_prompt = (
-        "You are a strict JSON validator for fabrication blueprint parsing. "
-        "You always output valid JSON with no commentary or extra text."
+    user_msg = USER_TEMPLATE.format(
+        donut_raw=(donut_raw or "")[:4000],  # keep prompt small-ish
+        layout_json=layout_str[:4000],
+        textract_json=textract_str[:4000],
+        keys=", ".join(SCHEMA_KEYS),
     )
 
-    user_prompt = f"""
-Validate and repair the following JSON object so it matches this exact schema:
+    # Responses API (json_object tool) to enforce structured output
+    resp = client.responses.create(
+        model=model,
+        reasoning={"effort": "medium"},
+        input=[
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": SYSTEM_MSG}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": user_msg}],
+            },
+        ],
+        # Ask the model to produce a single JSON object:
+        response_format={"type": "json_object"},
+    )
 
-{SCHEMA_DESC}
-
-Rules:
- - All counts must be integers (>=0)
- - 'weld_symbols_present' must be boolean
- - If any weld_symbols_count > 0, then weld_symbols_present must be true
- - If weld_symbols_present is false, weld_symbols_count must be 0
- - Fill any missing or null fields with logical defaults
- - Output only a JSON object. No extra text.
-
-Input object:
-{json.dumps(base, indent=2)}
-"""
-
+    # Pull text from the response
     try:
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
+        out_text = resp.output_text  # SDK helper that concatenates text from content parts
+    except Exception:
+        # Fallback: manual extraction if needed
+        out_text = ""
+        try:
+            chunks = resp.output[0].content
+            for c in chunks:
+                if c.type == "output_text":
+                    out_text += c.text
+        except Exception:
+            pass
 
-        content = resp.output[0].content[0].text
-        result = json.loads(content)
+    if not out_text:
+        logger.warning("Empty model reply; returning conservative defaults.")
+        return postprocess_schema({})
 
-        # Final local repair pass (ensures numeric types)
-        return _local_repair(result)
+    # Parse JSON
+    try:
+        obj = json.loads(out_text)
+    except Exception:
+        logger.warning("Model did not return valid JSON; returning conservative defaults.")
+        return postprocess_schema({})
 
-    except Exception as e:
-        logger.warning(f"[OpenAI validator] Fallback to local schema repair: {e}")
-        return base
+    return postprocess_schema(obj)
 
-
-# -----------------------------------------------------------------------------
-# DEMO ENTRY POINT
-# -----------------------------------------------------------------------------
+# ---------------- CLI smoke test ----------------
 if __name__ == "__main__":
-    test_input = {
-        "weld_symbols_present": True,
-        "weld_symbols_count": "4",
-        "dim_values_count": "3",
-        "bom_tag_count": None,
-        "bom_material_count": 2,
-        # Missing bom_qty_count
-    }
+    # Tiny demo payload (replace with real pipeline outputs)
+    donut_raw_demo = "<s_answer>{\"weld_symbols_present\": false,  \"weld_symbols_count\": 20,  \"dim_values_count\": 1,  \"bom_tag_count\": 0,  \"bom_material_count\": 0,  \"bom_qty_count\": 0}</s>"
+    layout_demo = {"weld_symbols_present": False, "weld_symbols_count": 4}  # pretend partial
+    textract_demo = {"ocr_words": 1234}  # pretend metadata
 
-    clean = validate_counts_with_openai(test_input)
-    print(json.dumps(clean, indent=2))
+    fixed = validate_with_openai(
+        donut_raw=donut_raw_demo,
+        layout_json=layout_demo,
+        textract_json=textract_demo,
+        model="gpt-4.1",
+    )
+    print(json.dumps(fixed, indent=2))

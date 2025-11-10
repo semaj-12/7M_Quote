@@ -1,0 +1,262 @@
+{
+  "type": "object",
+  "properties": {
+    "customerName": {
+      "type": "string",
+      "description": "Full name of the customer."
+    },
+    "architect": {
+      "type": "string",
+      "description": "Name of the architect."
+    },
+    "contractor": {
+      "type": "string",
+      "description": "Name of the contractor."
+    },
+    "metalFabricationMaterial": {
+      "type": "object",
+      "properties": {
+        "materialAbbreviation": {
+          "type": "string",
+          "description": "Abbreviation of the material."
+        },
+        "materialGrade": {
+          "type": "string",
+          "description": "Grade of the material."
+        },
+        "typeOfMaterial": {
+          "type": "string",
+          "description": "Type of the material."
+        },
+        "countOfMaterial": {
+          "type": "number",
+          "description": "Count of the material."
+        },
+        "quantityOfMaterial": {
+          "type": "number",
+          "description": "Quantity of the material."
+        },
+        "differentTypesOfMaterial": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "materialType": {
+                "type": "string",
+                "description": "Type of material."
+              }
+            },
+            "required": [
+              "materialType"
+            ]
+          },
+          "description": "List of different material types."
+        }
+      },
+      "required": [
+        "materialAbbreviation",
+        "materialGrade",
+        "typeOfMaterial",
+        "countOfMaterial",
+        "quantityOfMaterial",
+        "differentTypesOfMaterial"
+      ],
+      "description": "Details of metal fabrication material."
+    },
+    "weldSymbols": {
+      "type": "object",
+      "properties": {
+        "countOfWeldSymbols": {
+          "type": "number",
+          "description": "Count of weld symbols."
+        },
+        "repeatedWeldSymbols": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "weldSymbol": {
+                "type": "string",
+                "description": "Weld symbol."
+              }
+            },
+            "required": [
+              "weldSymbol"
+            ]
+          },
+          "description": "List of repeated weld symbols."
+        },
+        "descriptionOfWeldSymbols": {
+          "type": "string",
+          "description": "Description of weld symbols."
+        },
+        "weldSymbolRepresentationAWS": {
+          "type": "string",
+          "description": "Weld symbol as per AWS A2.4 code."
+        },
+        "listOfAllWeldSymbols": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "weldSymbol": {
+                "type": "string",
+                "description": "Weld symbol."
+              }
+            },
+            "required": [
+              "weldSymbol"
+            ]
+          },
+          "description": "List of all weld symbols."
+        }
+      },
+      "required": [
+        "countOfWeldSymbols",
+        "repeatedWeldSymbols",
+        "descriptionOfWeldSymbols",
+        "weldSymbolRepresentationAWS",
+        "listOfAllWeldSymbols"
+      ],
+      "description": "Details of weld symbols."
+    },
+    "dimensions": {
+      "type": "object",
+      "properties": {
+        "dimensionValues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "number",
+                "description": "Dimension value."
+              }
+            },
+            "required": [
+              "value"
+            ]
+          },
+          "description": "List of dimension values."
+        },
+        "inch": {
+          "type": "number",
+          "description": "Dimension in inches."
+        },
+        "feet": {
+          "type": "number",
+          "description": "Dimension in feet."
+        }
+      },
+      "required": [
+        "dimensionValues",
+        "inch",
+        "feet"
+      ],
+      "description": "Details of dimensions."
+    },
+    "views": {
+      "type": "object",
+      "properties": {
+        "sectionViews": {
+          "type": "string",
+          "description": "Details of section views."
+        },
+        "details": {
+          "type": "string",
+          "description": "Details of the views."
+        },
+        "planViews": {
+          "type": "string",
+          "description": "Details of plan views."
+        },
+        "sideViews": {
+          "type": "string",
+          "description": "Details of side views."
+        },
+        "cutViews": {
+          "type": "string",
+          "description": "Details of cut views."
+        }
+      },
+      "required": [
+        "sectionViews",
+        "details",
+        "planViews",
+        "sideViews",
+        "cutViews"
+      ],
+      "description": "Different types of views."
+    },
+    "materialDimensions": {
+      "type": "string",
+      "description": "Dimensions of the material."
+    },
+    "hardware": {
+      "type": "object",
+      "properties": {
+        "hardwareCounts": {
+          "type": "number",
+          "description": "Count of hardware."
+        },
+        "hardwareMaterial": {
+          "type": "string",
+          "description": "Material of the hardware."
+        },
+        "hardwareGrade": {
+          "type": "string",
+          "description": "Grade of the hardware."
+        },
+        "mechanicalHardware": {
+          "type": "string",
+          "description": "Details of mechanical hardware."
+        },
+        "hardwareAbbreviations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "abbreviation": {
+                "type": "string",
+                "description": "Hardware abbreviation."
+              }
+            },
+            "required": [
+              "abbreviation"
+            ]
+          },
+          "description": "List of hardware abbreviations."
+        }
+      },
+      "required": [
+        "hardwareCounts",
+        "hardwareMaterial",
+        "hardwareGrade",
+        "mechanicalHardware",
+        "hardwareAbbreviations"
+      ],
+      "description": "Details of hardware."
+    },
+    "fabricationDimensions": {
+      "type": "string",
+      "description": "Dimensions of fabrication."
+    },
+    "installationDimensions": {
+      "type": "string",
+      "description": "Dimensions of installation."
+    }
+  },
+  "required": [
+    "customerName",
+    "architect",
+    "contractor",
+    "metalFabricationMaterial",
+    "weldSymbols",
+    "dimensions",
+    "views",
+    "materialDimensions",
+    "hardware",
+    "fabricationDimensions",
+    "installationDimensions"
+  ]
+}
