@@ -1,23 +1,51 @@
-# React + Vite
+# Tape Measure AI (formerly 7M Quote)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+AI platform for trade contractors. Upload blueprints/scopes/docs → our AI parses drawings, extracts BOM & dimensions, and predicts **material + labor costs** with location-aware pricing and customer-specific adjustments. Review, tweak, and export to your systems.
 
-Currently, two official plugins are available:
+> **Status:** Alpha. Active development; APIs and data models may change.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+---
 
-## Expanding the ESLint configuration
+## SaaS flow with minor agentic flows
+Static SaaS flow along with an  **AI-agent framework** that orchestrates:  
+**parse → normalize → estimate → review → export**.  
+This keeps our core promise—**accurate cost estimations**—while automating the busywork around it.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
-# 7M_Quote
+---
 
-7M Quote is a platform that helps skilled trade subcontractors generate quotes from blueprints/drawings in minutes instead of days.  
-Users upload PDFs or CAD files → AI extracts dimensions, identifies materials, predicts labor costs, and applies real-time pricing.  
+## Key Capabilities (current)
+- 📄 **Blueprint & document parsing**: OCR + layout understanding → normalized fields
+- 🧮 **Estimation engine**: material pricing (location-aware) + labor time predictions
+- 🧠 **Customer-specific deltas**: learn adjustments over time from each shop’s history
+- 🔗 **Integrations (scaffolded)**: QuickBooks / Xero;
+- ✅ **Review & approval**: human-in-the-loop adjustments before export
+- 📊 **Evaluation harness (WIP)**: coverage, per-field accuracy, variance vs. baseline
 
-## Docs
-- [System Architecture](./ARCHITECTURE.md)
-- [Tech Stack](./TECH_STACK.md)
-- [API Documentation](./API.md)
-- [Database Schema](./DATA_SCHEMA.md)
-- [Data Models](./DATA_MODELS.md)
+---
+
+## Architecture at a Glance
+- **frontend/** – React app: upload → review → approve → export
+- **backend/** – Services & agents
+  - `parse/` – Textract / Donut / LayoutLMv3 / Reducto / GPT-4.1 mini pipeline
+  - `estimate/` – material + labor models, location pricing, customer deltas
+  - `agent/` – task orchestration, retries, guardrails, evaluation hooks
+- **db/** – Postgres schema & migrations (normalized doc + estimates + audit)
+- **docs/** – Design docs, API, data schema, models
+- **scripts/** – Utilities (pdf→images, dataset prep, eval runners)
+
+> Deep dives live in:  
+> - [System Architecture](./ARCHITECTURE.md)  
+> - [Tech Stack](./TECH_STACK.md)  
+> - [API Documentation](./API.md)  
+> - [Database Schema](./DATA_SCHEMA.md)  
+> - [Data Models](./DATA_MODELS.md)
+
+---
+
+## Quickstart (Local Dev)
+
+### 1) Prereqs
+- Node 18+ / PNPM or NPM
+- Docker & Docker Compose
+- Python 3.10+ (if running parsers locally)
+- AWS creds configured **if** using Textract

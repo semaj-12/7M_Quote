@@ -1,20 +1,7 @@
 # API Documentation
 
-Base URL: `http://localhost:5000/api`
+This document describes the core API endpoints used by the Tape Measure AI frontend, backend services, and the AI Agent Orchestrator.  
+All endpoints return JSON.  
+Base URL (local):  
+http://localhost:3000/api
 
-## Endpoints
-### Manual Upload
-- **POST** `/manual-upload`
-- Uploads PDF/Docs → triggers Textract + Comprehend parsing.
-
-### Auto Fetch
-- **GET** `/auto-fetch`
-- Pulls invoices, bills, payroll from QuickBooks/Xero via API.
-
-### Job Status
-- **GET** `/jobs/:id/status`
-- Returns parsing progress + normalized JSON.
-
-## Future
-- `/pricing/market` → fetch LME/CME material prices
-- `/ml/train` → retrain company-specific cost model
