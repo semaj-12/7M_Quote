@@ -1,5 +1,6 @@
 # /home/sagemaker-user/7m/hybrid/cli_demo.py
 import argparse, json
+from backend.hybrid import pipeline, run_blueprint_pipeline_v2
 from .pipeline import run_hybrid_on_image
 
 def main():

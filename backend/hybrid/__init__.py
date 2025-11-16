@@ -1,6 +1,5 @@
 # hybrid/__init__.py
-
-# Re-export schema constants/helpers if you put them in schemas.py
+from .pipeline_V2 import run_blueprint_pipeline_v2
 try:
     from .schemas import HYBRID_SCHEMA, SCHEMA_KEYS  # optional
 except Exception:
@@ -14,7 +13,7 @@ except Exception:
         "bom_qty_count",
     ]
 
-# Donut & LayoutLM adapters (assuming you already added donut_infer.py and layoutlm_infer.py)
+
 try:
     from .donut_infer import DonutCountsAdapter  # your Donut adapter class name
 except Exception:
@@ -33,7 +32,7 @@ except Exception:
     TextractOCRProvider = None
     TextractOCRToken = None
 
-# Reconciler & OpenAI validator (if you’ve added them)
+# Reconciler & OpenAI validator
 try:
     from .reconcile import reconcile_counts
 except Exception:
@@ -51,4 +50,5 @@ __all__ = [
     "TextractOCRProvider", "TextractOCRToken",
     "reconcile_counts",
     "validate_counts_with_openai",
+    "run_blueprint_pipeline_v2",
 ]
