@@ -4,34 +4,55 @@ from typing import Dict, Any, List
 from ..types import Region, ProviderResult, BomRow, WeldSymbol, DimensionEntity
 
 try:
-    # Adjust this import to your actual Reducto client
-    from backend.hybrid.reducers import reducto_client
+    from backend.hybrid.adapters import reducto_adapter
 except ImportError:
-    reducto_client = None  # type: ignore[assignment]
+    reducto_adapter = None  # type: ignore[assignment]
 
 NAME = "reducto"
 
 
 def parse_region(region: Region, context: Dict[str, Any] | None = None) -> ProviderResult:
-    if reducto_client is None:
+    if reducto_adapter is None:
         return ProviderResult(provider=NAME, region=region)
 
-    # TODO: call Reducto in the way your V1 pipeline does.
-    #
-    # red_result = reducto_client.parse_region(
-    #     doc_path=region.doc_path,
-    #     page_index=region.page_index,
-    #     bbox=region.bbox,
-    #     region_type=region.region_type,
-    # )
-
-    red_result: Dict[str, Any] = {}
+    cfg = context or {}
+    try:
+        candidates = reducto_adapter.predict(region.doc_path, cfg) if hasattr(reducto_adapter, "predict") else []
+    except Exception as exc:
+        return ProviderResult(provider=NAME, region=region, raw={"error": str(exc)})
 
     bom_rows: List[BomRow] = []
     welds: List[WeldSymbol] = []
     dims: List[DimensionEntity] = []
 
-    # TODO: map red_result into BomRow / WeldSymbol / DimensionEntity
+    for c in candidates:
+        et = c.get("entity_type")
+        fields = c.get("fields") or {}
+        conf = float(c.get("confidence", 0.6))
+        if et == "WELD":
+            welds.append(
+                WeldSymbol(
+                    id=c.get("id"),
+                    type=fields.get("symbol"),
+                    reference=fields.get("description"),
+                    location={"page_index": region.page_index, "bbox": c.get("bbox")},
+                    provider=NAME,
+                    confidence=conf,
+                )
+            )
+        elif et == "DIMENSION":
+            dims.append(
+                DimensionEntity(
+                    id=c.get("id"),
+                    value_in=_safe_float(fields.get("value") or fields.get("normalized_to_in")),
+                    unit=fields.get("unit") or "inch",
+                    location={"page_index": region.page_index, "bbox": c.get("bbox")},
+                    provider=NAME,
+                    confidence=conf,
+                )
+            )
+
+    red_result: Dict[str, Any] = {"candidates": candidates}
 
     return ProviderResult(
         provider=NAME,
@@ -41,3 +62,10 @@ def parse_region(region: Region, context: Dict[str, Any] | None = None) -> Provi
         dimensions=dims,
         raw=red_result,
     )
+
+
+def _safe_float(val: Any) -> float | None:
+    try:
+        return float(val)
+    except Exception:
+        return None
