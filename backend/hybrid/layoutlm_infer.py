@@ -1,10 +1,24 @@
 # hybrid/layoutlm_infer.py
+import logging
 import os
-import torch
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import torch
+from PIL import Image
 from transformers import LayoutLMv3ForTokenClassification, LayoutLMv3Processor
+
+try:  # Local import is optional for unit tests that stub Textract heuristics.
+    from .textract_infer import extract_words
+except Exception:  # pragma: no cover - defensive; tests stub the helper.
+    extract_words = None
+
+logger = logging.getLogger("hybrid.layoutlm")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # Env var so this is portable across machines
 DEFAULT_LLMV3_DIR = os.environ.get(
@@ -189,3 +203,110 @@ class LayoutLMv3Adapter:
                 words.append(OCRToken(text=text, bbox=(x0, y0, x1, y1)))
 
         return self.predict_from_ocr(words, (page_w or 1000, page_h or 1000))
+
+
+_LAYOUTLM_SINGLETON: Optional[LayoutLMv3Adapter] = None
+_LAYOUTLM_LOAD_FAILED = False
+
+
+def _empty_counts() -> Dict[str, int | bool]:
+    return {
+        "weld_symbols_present": False,
+        "weld_symbols_count": 0,
+        "dim_values_count": 0,
+        "bom_tag_count": 0,
+        "bom_material_count": 0,
+        "bom_qty_count": 0,
+    }
+
+
+def _ensure_adapter() -> Optional[LayoutLMv3Adapter]:
+    global _LAYOUTLM_SINGLETON, _LAYOUTLM_LOAD_FAILED
+    if _LAYOUTLM_SINGLETON is not None:
+        return _LAYOUTLM_SINGLETON
+    if _LAYOUTLM_LOAD_FAILED:
+        return None
+    try:
+        _LAYOUTLM_SINGLETON = LayoutLMv3Adapter()
+    except Exception as exc:  # pragma: no cover - depends on model availability
+        _LAYOUTLM_LOAD_FAILED = True
+        logger.warning("LayoutLMv3 unavailable (%s); returning conservative defaults.", exc)
+        return None
+    return _LAYOUTLM_SINGLETON
+
+
+def _textract_words_to_tokens(words: List[Dict], page_size: Tuple[int, int]) -> List[OCRToken]:
+    tokens: List[OCRToken] = []
+    width, height = page_size
+    for w in words:
+        text = (w or {}).get("text") or (w or {}).get("Text") or ""
+        bbox = (w or {}).get("bbox")
+        if not text or bbox is None:
+            continue
+        if len(bbox) == 4:
+            x0, y0, x1, y1 = bbox
+        else:
+            continue
+        # Textract words return (left, top, width, height) in relative coords.
+        if 0.0 <= x0 <= 1.0 and 0.0 <= y0 <= 1.0 and 0.0 <= x1 <= 1.5 and 0.0 <= y1 <= 1.5:
+            left, top, w_rel, h_rel = x0, y0, x1, y1
+            x0 = int(left * width)
+            y0 = int(top * height)
+            x1 = x0 + int(w_rel * width)
+            y1 = y0 + int(h_rel * height)
+        tokens.append(OCRToken(text=text, bbox=(int(x0), int(y0), int(x1), int(y1))))
+    return tokens
+
+
+def _coerce_counts(raw: Dict[str, int | bool]) -> Dict[str, int | bool]:
+    counts = _empty_counts()
+    for key in counts:
+        if key not in raw:
+            continue
+        if key == "weld_symbols_present":
+            counts[key] = bool(raw.get(key))
+        else:
+            try:
+                counts[key] = max(0, int(raw.get(key, 0)))
+            except Exception:
+                counts[key] = 0
+    return counts
+
+
+def predict_counts_with_layoutlm(image_path: str) -> Dict[str, int | bool]:
+    """Run LayoutLMv3 on Textract tokens if the checkpoint is available.
+
+    When the fine-tuned checkpoint is absent (common in CI), we return
+    conservative defaults instead of raising so the hybrid pipeline continues
+    to function for smoke tests.
+    """
+
+    adapter = _ensure_adapter()
+    if adapter is None:
+        return _empty_counts()
+
+    try:
+        with Image.open(image_path) as im:
+            page_size = im.size
+    except Exception:
+        page_size = (1000, 1000)
+
+    textract_words: List[Dict] = []
+    if extract_words is not None:
+        try:
+            textract_words = extract_words(image_path)
+        except Exception:  # pragma: no cover - network dependent
+            logger.warning("Textract words unavailable; LayoutLM defaults to empty tokens.")
+            textract_words = []
+
+    tokens = _textract_words_to_tokens(textract_words, page_size) if textract_words else []
+    if not tokens:
+        return _empty_counts()
+
+    try:
+        preds = adapter.predict_from_ocr(tokens, page_size)
+    except Exception as exc:  # pragma: no cover - model/runtime dependent
+        logger.warning("LayoutLM inference failed (%s); returning defaults.", exc)
+        return _empty_counts()
+
+    return _coerce_counts(preds)

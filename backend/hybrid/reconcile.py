@@ -1,6 +1,64 @@
 from typing import Any, Dict, List, Tuple
 import copy
 
+from .schemas import Counts
+
+SCHEMA_KEYS = [
+    "weld_symbols_present",
+    "weld_symbols_count",
+    "dim_values_count",
+    "bom_tag_count",
+    "bom_material_count",
+    "bom_qty_count",
+]
+
+
+def _empty_counts() -> Dict[str, int | bool]:
+    return {
+        "weld_symbols_present": False,
+        "weld_symbols_count": 0,
+        "dim_values_count": 0,
+        "bom_tag_count": 0,
+        "bom_material_count": 0,
+        "bom_qty_count": 0,
+    }
+
+
+def _merge_partial_counts(base: Dict[str, int | bool], incoming: Dict[str, Any]) -> None:
+    for key in SCHEMA_KEYS:
+        if key not in incoming:
+            continue
+        if key == "weld_symbols_present":
+            base[key] = bool(base.get(key, False) or bool(incoming.get(key)))
+        else:
+            try:
+                candidate = int(incoming.get(key, 0))
+            except Exception:
+                candidate = 0
+            base[key] = max(int(base.get(key, 0)), max(0, candidate))
+
+
+def reconcile_counts(
+    donut_out: Dict[str, Any] | None,
+    layout_out: Dict[str, Any] | None,
+    textract_out: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Fuse Donut/LayoutLM/Textract predictions into a complete Counts payload."""
+
+    merged = _empty_counts()
+
+    donut_json = (donut_out or {}).get("json") if isinstance(donut_out, dict) else None
+    if isinstance(donut_json, dict):
+        _merge_partial_counts(merged, donut_json)
+
+    if isinstance(layout_out, dict):
+        _merge_partial_counts(merged, layout_out)
+
+    if isinstance(textract_out, dict):
+        _merge_partial_counts(merged, textract_out)
+
+    return Counts(**merged).model_dump()
+
 # --- Hotspots detection -------------------------------------------------------
 
 def find_hotspots(candidates: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
