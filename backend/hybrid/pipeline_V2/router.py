@@ -21,25 +21,36 @@ def classify_document(doc_path: str, *, job_context: Dict[str, Any] | None = Non
         raise FileNotFoundError(f"Document not found: {doc_path}")
 
     # TODO: plug in a real classifier if you add more doc types
-    doc_type = job_context.get("doc_type") or "blueprint"
+    doc_type = _normalize_doc_type(job_context.get("doc_type"))
 
     if src_path.suffix.lower() == ".pdf":
         pages = _load_pdf_pages(src_path, job_context=job_context)
     else:
-        pages = [_load_single_image(src_path)]
+        pages = [_load_single_image(src_path, job_context=job_context)]
 
     return DocumentInfo(doc_path=doc_path, doc_type=doc_type, pages=pages)
 
 
-def _load_single_image(path: Path, page_index: int = 0) -> PageImage:
+def _load_single_image(path: Path, *, job_context: Dict[str, Any], page_index: int = 0) -> PageImage:
     """
-    Load a single image file into bytes (converted to PNG) for downstream providers.
+    Load a single image file into bytes (converted to configured format) for downstream providers.
+    Mirrors the PDF page loader by writing a copy into the working directory.
     """
-    img = Image.open(path)
-    with BytesIO() as buf:
-        img.save(buf, format="PNG")
-        data = buf.getvalue()
-    return PageImage(page_index=page_index, image_path=str(path), image_bytes=data)
+    fmt = (job_context.get("pdf_image_format") or "png").lower()
+    tmp_root = Path(job_context.get("work_dir", "/tmp/hybrid_v2"))
+    out_dir = tmp_root / path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{path.stem}_p{page_index+1:04d}.{fmt}"
+
+    with Image.open(path) as img:
+        converted = img.convert("RGB") if fmt in {"jpg", "jpeg"} else img.convert("RGBA")
+        with BytesIO() as buf:
+            converted.save(buf, format=fmt.upper())
+            data = buf.getvalue()
+        converted.save(out_path, format=fmt.upper())
+        converted.close()
+
+    return PageImage(page_index=page_index, image_path=str(out_path), image_bytes=data)
 
 
 def _load_pdf_pages(pdf_path: Path, *, job_context: Dict[str, Any]) -> List[PageImage]:
@@ -47,7 +58,7 @@ def _load_pdf_pages(pdf_path: Path, *, job_context: Dict[str, Any]) -> List[Page
     Convert a PDF into per-page PNG bytes, mirroring the V1/SageMaker flow.
     """
     dpi = int(job_context.get("pdf_dpi", 300))
-    fmt = job_context.get("pdf_image_format", "png")
+    fmt = (job_context.get("pdf_image_format") or "png").lower()
     tmp_root = Path(job_context.get("work_dir", "/tmp/hybrid_v2"))
     out_dir = tmp_root / pdf_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -62,11 +73,14 @@ def _load_pdf_pages(pdf_path: Path, *, job_context: Dict[str, Any]) -> List[Page
 
     pages: List[PageImage] = []
     for idx, pil_img in enumerate(pil_pages):
+        converted = pil_img.convert("RGB") if fmt in {"jpg", "jpeg"} else pil_img.convert("RGBA")
         with BytesIO() as buf:
-            pil_img.save(buf, format=fmt.upper())
+            converted.save(buf, format=fmt.upper())
             data = buf.getvalue()
         out_path = out_dir / f"{pdf_path.stem}_p{idx+1:04d}.{fmt.lower()}"
-        pil_img.save(out_path)
+        converted.save(out_path, format=fmt.upper())
+        converted.close()
+        pil_img.close()
         pages.append(
             PageImage(
                 page_index=idx,
@@ -76,6 +90,13 @@ def _load_pdf_pages(pdf_path: Path, *, job_context: Dict[str, Any]) -> List[Page
         )
 
     return pages
+
+
+def _normalize_doc_type(candidate: Any) -> str:
+    valid_types = {"blueprint", "invoice", "po", "unknown"}
+    if isinstance(candidate, str) and candidate in valid_types:
+        return candidate
+    return "blueprint"
 
 
 def detect_regions(
