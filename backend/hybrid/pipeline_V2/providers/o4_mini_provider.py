@@ -1,13 +1,14 @@
+# backend/hybrid/pipeline_V2/providers/o4_mini_provider.py
 from __future__ import annotations
+
 import base64
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 from openai import OpenAI
 
 from ..config import settings
 from ..types import (
-    DocumentInfo,
     Region,
     ProviderResult,
     BomRow,
@@ -16,6 +17,7 @@ from ..types import (
     SheetMetadata,
 )
 
+# Initialize OpenAI client using env-driven settings
 client = OpenAI(
     api_key=settings.OPENAI_API_KEY,
     base_url=settings.OPENAI_BASE_URL or None,
@@ -81,6 +83,9 @@ Return ONLY a strict JSON object, no comments or extra text.
 
 
 def _encode_image_to_data_url(image_bytes: bytes) -> str:
+    """
+    Encode raw image bytes as a data URL suitable for the Responses API.
+    """
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
@@ -88,6 +93,12 @@ def _encode_image_to_data_url(image_bytes: bytes) -> str:
 def first_pass_page(image_bytes: bytes) -> Dict[str, Any]:
     """
     Run o4-mini on a single page image and return parsed JSON (dict).
+
+    NOTE:
+    - We do NOT use `response_format` because the OpenAI SDK version
+      in this environment does not support that argument on Responses.create().
+    - Instead, we rely on a strong prompt asking for strict JSON and
+      then parse the text.
     """
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set; required for o4-mini provider")
@@ -105,15 +116,28 @@ def first_pass_page(image_bytes: bytes) -> Dict[str, Any]:
                 ],
             }
         ],
-        response_format={"type": "json_object"},
     )
 
-    # The SDK offers output_text shortcut when response_format is json_object
-    json_text = response.output[0].content[0].text  # type: ignore[attr-defined]
+    # Try to extract the JSON string from the response in a way that works
+    # across SDK minor versions.
+    #
+    # Typical shape (1.x SDK):
+    #   response.output[0].content[0].text
+    out0 = response.output[0].content[0]
+
+    if hasattr(out0, "text"):
+        json_text = out0.text
+    else:
+        # Fallback: stringify and hope it's already plain JSON
+        json_text = str(out0)
+
     return json.loads(json_text)
 
 
 def to_bom_result(region: Region, o4_results_for_page: Dict[str, Any]) -> ProviderResult:
+    """
+    Convert o4-mini JSON for this page into BomRow ProviderResult.
+    """
     rows = []
     for r in o4_results_for_page.get("bom_rows", []):
         rows.append(
@@ -136,6 +160,9 @@ def to_bom_result(region: Region, o4_results_for_page: Dict[str, Any]) -> Provid
 
 
 def to_welds_result(region: Region, o4_results_for_page: Dict[str, Any]) -> ProviderResult:
+    """
+    Convert o4-mini JSON for this page into WeldSymbol ProviderResult.
+    """
     welds = []
     for w in o4_results_for_page.get("weld_symbols", []):
         welds.append(
@@ -159,6 +186,9 @@ def to_welds_result(region: Region, o4_results_for_page: Dict[str, Any]) -> Prov
 
 
 def to_dimensions_result(region: Region, o4_results_for_page: Dict[str, Any]) -> ProviderResult:
+    """
+    Convert o4-mini JSON for this page into DimensionEntity ProviderResult.
+    """
     dims = []
     for d in o4_results_for_page.get("dimensions", []):
         dims.append(
@@ -179,6 +209,9 @@ def to_dimensions_result(region: Region, o4_results_for_page: Dict[str, Any]) ->
 
 
 def to_metadata_result(region: Region, o4_results_for_page: Dict[str, Any]) -> ProviderResult:
+    """
+    Convert o4-mini JSON for this page into SheetMetadata ProviderResult.
+    """
     meta_dict = o4_results_for_page.get("metadata") or {}
     metadata = SheetMetadata(
         sheet_number=meta_dict.get("sheet_number"),
@@ -188,8 +221,19 @@ def to_metadata_result(region: Region, o4_results_for_page: Dict[str, Any]) -> P
         scale=meta_dict.get("scale"),
         drawn_by=meta_dict.get("drawn_by"),
         checked_by=meta_dict.get("checked_by"),
-        extra={k: v for k, v in meta_dict.items() if k not in {
-            "sheet_number", "sheet_title", "revision", "date", "scale", "drawn_by", "checked_by"
-        }},
+        extra={
+            k: v
+            for k, v in meta_dict.items()
+            if k
+            not in {
+                "sheet_number",
+                "sheet_title",
+                "revision",
+                "date",
+                "scale",
+                "drawn_by",
+                "checked_by",
+            }
+        },
     )
     return ProviderResult(provider=NAME, region=region, metadata=metadata, raw=o4_results_for_page)
