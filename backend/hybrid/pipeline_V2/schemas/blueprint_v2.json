@@ -1,0 +1,147 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tapemeasure.ai/schemas/blueprint_v2.json",
+  "title": "Blueprint V2",
+  "type": "object",
+  "required": ["version", "doc_id", "source", "sheets"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "blueprint_v2"
+    },
+    "doc_id": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "required": ["filename"],
+      "properties": {
+        "filename": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "sheets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["sheet_id", "page_index", "metadata", "bom_rows", "weld_symbols", "dimensions"],
+        "properties": {
+          "sheet_id": { "type": "string" },
+          "page_index": { "type": "integer", "minimum": 0 },
+          "metadata": {
+            "type": "object",
+            "properties": {
+              "sheet_number": { "type": ["string", "null"] },
+              "sheet_title": { "type": ["string", "null"] },
+              "revision": { "type": ["string", "null"] },
+              "date": { "type": ["string", "null"] },
+              "scale": { "type": ["string", "null"] },
+              "drawn_by": { "type": ["string", "null"] },
+              "checked_by": { "type": ["string", "null"] }
+            },
+            "additionalProperties": true
+          },
+          "bom_rows": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "mark": { "type": ["string", "null"] },
+                "description": { "type": ["string", "null"] },
+                "profile": { "type": ["string", "null"] },
+                "material": { "type": ["string", "null"] },
+                "length_in": { "type": ["number", "null"] },
+                "quantity": { "type": ["number", "null"] },
+                "weight_per_ft_lb": { "type": ["number", "null"] },
+                "total_weight_lb": { "type": ["number", "null"] },
+                "notes": { "type": ["string", "null"] }
+              },
+              "additionalProperties": false
+            }
+          },
+          "weld_symbols": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": ["string", "null"] },
+                "type": { "type": ["string", "null"] },
+                "size_in": { "type": ["number", "null"] },
+                "length_in": { "type": ["number", "null"] },
+                "all_around": { "type": ["boolean", "null"] },
+                "both_sides": { "type": ["boolean", "null"] },
+                "reference": { "type": ["string", "null"] },
+                "location": {
+                  "type": ["object", "null"],
+                  "properties": {
+                    "page_index": { "type": "integer" },
+                    "bbox": {
+                      "type": "array",
+                      "items": { "type": "number" },
+                      "minItems": 4,
+                      "maxItems": 4
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "dimensions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": ["string", "null"] },
+                "value_in": { "type": ["number", "null"] },
+                "unit": { "type": ["string", "null"] },
+                "tolerance_in": { "type": ["number", "null"] },
+                "location": {
+                  "type": ["object", "null"],
+                  "properties": {
+                    "page_index": { "type": "integer" },
+                    "bbox": {
+                      "type": "array",
+                      "items": { "type": "number" },
+                      "minItems": 4,
+                      "maxItems": 4
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": ["string", "null"] },
+                "text": { "type": ["string", "null"] },
+                "location": {
+                  "type": ["object", "null"],
+                  "properties": {
+                    "page_index": { "type": "integer" },
+                    "bbox": {
+                      "type": "array",
+                      "items": { "type": "number" },
+                      "minItems": 4,
+                      "maxItems": 4
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
