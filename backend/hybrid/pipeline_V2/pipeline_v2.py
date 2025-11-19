@@ -12,9 +12,9 @@ from .providers import (
 )
 from .adjudicators import (
     bom_adjudicator,
-    # welds_adjudicator,
-    # dimensions_adjudicator,
-    # metadata_adjudicator,
+    welds_adjudicator,
+    dimensions_adjudicator,
+    metadata_adjudicator,
 )
 from .normalizers import blueprint_v2 as blueprint_normalizer
 
@@ -85,9 +85,9 @@ def run_blueprint_pipeline_v2(doc_path: str, *, job_context: Dict[str, Any] | No
 
     # 5. adjudicate entities
     bom_rows = bom_adjudicator.adjudicate(provider_results["bom"])
-    welds = []       # TODO: welds_adjudicator.adjudicate(provider_results["welds"])
-    dimensions = []  # TODO: dimensions_adjudicator.adjudicate(provider_results["dimensions"])
-    metadata = None  # TODO: metadata_adjudicator.adjudicate(provider_results["metadata"])
+    welds = welds_adjudicator.adjudicate(provider_results["welds"])
+    dimensions = dimensions_adjudicator.adjudicate(provider_results["dimensions"])
+    metadata = metadata_adjudicator.adjudicate(provider_results["metadata"])
     notes = []       # optional
 
     # 6. normalize
