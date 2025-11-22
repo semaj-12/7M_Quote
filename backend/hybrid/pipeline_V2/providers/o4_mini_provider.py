@@ -97,8 +97,8 @@ def first_pass_page(image_bytes: bytes) -> Dict[str, Any]:
     NOTE:
     - We do NOT use `response_format` because the OpenAI SDK version
       in this environment does not support that argument on Responses.create().
-    - Instead, we rely on a strong prompt asking for strict JSON and
-      then parse the text.
+    - We prefer `response.output_text` when available, and fall back
+      to indexing into `response.output[0].content[0].text`.
     """
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set; required for o4-mini provider")
@@ -118,18 +118,26 @@ def first_pass_page(image_bytes: bytes) -> Dict[str, Any]:
         ],
     )
 
-    # Try to extract the JSON string from the response in a way that works
-    # across SDK minor versions.
-    #
-    # Typical shape (1.x SDK):
-    #   response.output[0].content[0].text
-    out0 = response.output[0].content[0]
+    # 1) Prefer the high-level convenience property if present (newer SDKs).
+    json_text = getattr(response, "output_text", None)
 
-    if hasattr(out0, "text"):
-        json_text = out0.text
-    else:
-        # Fallback: stringify and hope it's already plain JSON
-        json_text = str(out0)
+    # 2) If that's missing/None, fall back to older-style indexing.
+    if not json_text:
+        output = getattr(response, "output", None)
+        if output is None or len(output) == 0:
+            # Debug-friendly error so we can see what the response actually looked like
+            raise RuntimeError(f"o4-mini response had no output: {response!r}")
+
+        first_item = output[0]
+        content_list = getattr(first_item, "content", None)
+        if not content_list:
+            raise RuntimeError(f"o4-mini response.output[0] had no content: {response!r}")
+
+        out0 = content_list[0]
+        if hasattr(out0, "text"):
+            json_text = out0.text
+        else:
+            json_text = str(out0)
 
     return json.loads(json_text)
 
